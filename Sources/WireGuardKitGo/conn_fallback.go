@@ -1,0 +1,436 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * Copyright (C) 2026 Alkira. All Rights Reserved.
+ *
+ * In-process UDP/TCP fallback transport for wireguard-go.
+ *
+ * WireGuard is natively UDP-only. When UDP to the server is blocked, this
+ * conn.Bind transparently tunnels the very same WG datagrams over a WebSocket
+ * (wss/443) carrier to a relay, then back into the normal WG pipeline on the
+ * server. The WG crypto and handshake bytes are unchanged — only the carrier
+ * differs — so the tunnel interface and peer config stay identical and there is
+ * no interface restart on a native<->fallback switch.
+ *
+ * This device.NewDevice(tun, bind, logger)
+ * takes the Bind as a constructor parameter, so no fork of wireguard-go is
+ * needed. The default UDP path is delegated to conn.NewStdNetBind(); the TCP
+ * path is a single wss connection whose binary frames each carry one WG
+ * datagram (WebSocket framing replaces an explicit length prefix).
+ *
+ * NOTE: this file is duplicated verbatim in the wireguard-apple bridge
+ * (Sources/WireGuardKitGo/conn_fallback.go); keep the two byte-identical.
+ */
+
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/net/websocket"
+	"golang.zx2c4.com/wireguard/conn"
+)
+
+// relayEndpointKey is the non-standard UAPI line the C++ side emits to carry
+// the wss relay URL through wgTurnOn's settings string. wireguard-go's IpcSet
+// rejects unknown keys, so the bridge must strip these lines before IpcSet and
+// hand the value to NewFallbackBind.
+const relayEndpointKey = "relay_endpoint="
+
+// SplitRelayEndpoint removes any relay_endpoint= lines from a UAPI settings
+// string and returns the last relay URL found plus the cleaned settings safe to
+// pass to device.IpcSet. Returns an empty URL when none is present.
+func SplitRelayEndpoint(settings string) (relayURL, cleaned string) {
+	lines := strings.Split(settings, "\n")
+	kept := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, relayEndpointKey) {
+			relayURL = strings.TrimSpace(line[len(relayEndpointKey):])
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return relayURL, strings.Join(kept, "\n")
+}
+
+// Carrier modes for fallbackBind.mode (accessed atomically).
+const (
+	carrierUDP int32 = iota
+	carrierTCP
+)
+
+// How long the bind tolerates UDP silence after Open before falling back to
+// TCP, and how often it re-probes UDP once on the TCP carrier. UDP is always
+// the preferred carrier — TCP is a fallback only (TCP-over-TCP degrades under
+// loss), so we keep trying to climb back to UDP.
+const (
+	udpSilenceTimeout = 8 * time.Second
+	udpReprobeEvery   = 30 * time.Second
+	udpReprobeWindow  = 5 * time.Second
+)
+
+// carrierLogf, when set by the bridge (wgTurnOn) to the device's Verbosef,
+// receives carrier lifecycle diagnostics (dial, UDP<->TCP switch, dial errors).
+// nil keeps the carrier silent. Intentionally NOT per-packet — that would spam
+// the log with every transport datagram in TCP mode.
+var carrierLogf func(string, ...interface{})
+
+func clog(format string, args ...interface{}) {
+	if carrierLogf != nil {
+		carrierLogf(format, args...)
+	}
+}
+
+// fallbackBind implements conn.Bind. It embeds the stock UDP bind and adds one
+// wss carrier to a relay. Send() routes per the current mode; Receive() pulls
+// from whichever carrier delivered a packet (the UDP fns from the inner bind
+// plus one appended fn draining the wss reader).
+type fallbackBind struct {
+	inner    conn.Bind // conn.NewStdNetBind(): the native UDP path
+	relayURL string    // wss://host:443/path; empty disables the TCP carrier
+
+	mode int32 // carrierUDP | carrierTCP (atomic)
+
+	// lastUDPRecvNano is the wall-clock time of the most recent inbound UDP
+	// packet (atomic). Stale-ness past udpSilenceTimeout triggers fallback.
+	lastUDPRecvNano int64
+
+	// canonEP is the peer endpoint parsed from the WG config. TCP-delivered
+	// packets are reported as coming from it so WG's roaming logic does not
+	// re-home the peer onto the (meaningless) relay socket address.
+	canonEP atomic.Value // conn.Endpoint
+
+	mu      sync.Mutex
+	ws      *websocket.Conn
+	recvCh  chan []byte
+	closeCh chan struct{}
+	closed  bool
+}
+
+// NewFallbackBind returns a conn.Bind that tunnels WG over UDP, falling back to
+// a wss carrier at relayURL when UDP is blocked. An empty relayURL yields the
+// stock UDP-only behavior (no carrier ever created).
+func NewFallbackBind(relayURL string) conn.Bind {
+	return &fallbackBind{
+		inner:    conn.NewStdNetBind(),
+		relayURL: relayURL,
+	}
+}
+
+// Open delegates to the inner UDP bind, wraps its receive fns to track UDP
+// liveness, and appends one fn that drains wss frames. A monitor goroutine
+// drives the UDP<->TCP switch.
+func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
+	innerFns, actualPort, err := b.inner.Open(port)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	b.mu.Lock()
+	b.closed = false
+	b.recvCh = make(chan []byte, 128)
+	b.closeCh = make(chan struct{})
+	b.mu.Unlock()
+	atomic.StoreInt32(&b.mode, carrierUDP)
+	atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
+
+	fns := make([]conn.ReceiveFunc, 0, len(innerFns)+1)
+	for _, fn := range innerFns {
+		inner := fn
+		fns = append(fns, func(buf []byte) (int, conn.Endpoint, error) {
+			n, ep, ferr := inner(buf)
+			if ferr == nil {
+				atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
+			}
+			return n, ep, ferr
+		})
+	}
+
+	if b.relayURL != "" {
+		fns = append(fns, b.receiveTCP)
+		go b.monitor()
+	}
+
+	return fns, actualPort, nil
+}
+
+// receiveTCP blocks until a wss frame arrives, the bind closes, or the carrier
+// drops. Delivered packets are attributed to the canonical peer endpoint.
+func (b *fallbackBind) receiveTCP(buf []byte) (int, conn.Endpoint, error) {
+	b.mu.Lock()
+	recvCh, closeCh := b.recvCh, b.closeCh
+	b.mu.Unlock()
+	if recvCh == nil {
+		return 0, nil, net.ErrClosed
+	}
+
+	select {
+	case frame, ok := <-recvCh:
+		if !ok {
+			return 0, nil, net.ErrClosed
+		}
+		n := copy(buf, frame)
+		ep, _ := b.canonEP.Load().(conn.Endpoint)
+		if ep == nil {
+			// No endpoint parsed yet; drop rather than hand WG a nil ep.
+			return 0, nil, net.ErrClosed
+		}
+		return n, ep, nil
+	case <-closeCh:
+		return 0, nil, net.ErrClosed
+	}
+}
+
+// Send routes the packet over the carrier selected by the current mode.
+func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
+	if atomic.LoadInt32(&b.mode) == carrierTCP {
+		return b.sendTCP(buf)
+	}
+	return b.inner.Send(buf, ep)
+}
+
+// sendTCP lazily (re)establishes the wss carrier and writes one binary frame.
+func (b *fallbackBind) sendTCP(buf []byte) error {
+	ws, err := b.ensureWS()
+	if err != nil {
+		clog("CARRIER sendTCP ensureWS err: %v", err)
+		return err
+	}
+	return websocket.Message.Send(ws, buf)
+}
+
+// wstunnel (Rust v10.x) handshake constants. The relay is a wstunnel server
+// (`wstunnel server wss://...`); we speak its client protocol in-process so no
+// wstunnel client subprocess is needed. The tunnel destination is carried as a
+// JWT in the Sec-WebSocket-Protocol header, formatted "v1, <prefix><jwt>"; the
+// server echoes back just "v1" (which x/net/websocket validates against
+// config.Protocol[0]) and extracts the JWT by splitting on the prefix. The
+// upgrade path must be /<prefix>/events. The server signs its own JWTs with a
+// throwaway time-based key and does NOT verify the signature on decode, so any
+// structurally valid HS256 token is accepted — only the claims matter.
+const (
+	wstunnelJWTPrefix     = "authorization.bearer."
+	wstunnelDefaultTarget = "localhost:51820" // where the wstunnel server reaches WG
+	wstunnelDefaultPath   = "/wstunnel/events"
+)
+
+// buildWstunnelToken builds the JWT that mirrors wstunnel's JwtTunnelConfig:
+// {"id":<uuid>,"p":{"Udp":{"timeout":null}},"r":<host>,"rp":<port>}. The "p"
+// field uses serde's externally-tagged enum form. The signature is unverified
+// by the server, so it is a plain HS256 over an arbitrary key.
+func buildWstunnelToken(host string, port uint16) (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x40 // RFC 4122 version 4
+	raw[8] = (raw[8] & 0x3f) | 0x80 // variant 10
+	uuid := fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
+
+	claims := map[string]interface{}{
+		"id": uuid,
+		"p":  map[string]interface{}{"Udp": map[string]interface{}{"timeout": nil}},
+		"r":  host,
+		"rp": port,
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+
+	enc := base64.RawURLEncoding
+	signingInput := enc.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + enc.EncodeToString(payload)
+	mac := hmac.New(sha256.New, []byte("wstunnel")) // server ignores the signature
+	mac.Write([]byte(signingInput))
+	return signingInput + "." + enc.EncodeToString(mac.Sum(nil)), nil
+}
+
+// parseRelay splits the configured relay URL into the URL to dial (forced to a
+// /<prefix>/events path), the forward target (host/port the wstunnel server
+// should reach WG on, taken from a ?target=host:port query and stripped before
+// dialing — default localhost:51820), and a same-host http(s) Origin required
+// by the WS handshake.
+func parseRelay(relayURL string) (dialURL, host string, port uint16, origin string, err error) {
+	u, perr := url.Parse(relayURL)
+	if perr != nil {
+		return "", "", 0, "", perr
+	}
+
+	host, port = "localhost", 51820
+	q := u.Query()
+	if t := q.Get("target"); t != "" {
+		if h, p, serr := net.SplitHostPort(t); serr == nil {
+			if pn, cerr := strconv.Atoi(p); cerr == nil && pn > 0 && pn <= 65535 {
+				host, port = h, uint16(pn)
+			}
+		}
+		q.Del("target")
+		u.RawQuery = q.Encode()
+	}
+
+	if u.Path == "" || u.Path == "/" {
+		u.Path = wstunnelDefaultPath
+	}
+
+	scheme := "https"
+	if u.Scheme == "ws" {
+		scheme = "http"
+	}
+	origin = scheme + "://" + u.Host
+	return u.String(), host, port, origin, nil
+}
+
+// ensureWS returns the live wss connection, dialing (and starting the reader
+// goroutine) on first use or after a drop. Caller-agnostic to mode.
+func (b *fallbackBind) ensureWS() (*websocket.Conn, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil, net.ErrClosed
+	}
+	if b.ws != nil {
+		return b.ws, nil
+	}
+
+	dialURL, host, port, origin, err := parseRelay(b.relayURL)
+	if err != nil {
+		return nil, err
+	}
+	token, err := buildWstunnelToken(host, port)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg, err := websocket.NewConfig(dialURL, origin)
+	if err != nil {
+		return nil, err
+	}
+	// Sec-WebSocket-Protocol: v1, authorization.bearer.<jwt> — the server
+	// returns "v1", matching config.Protocol[0] so the handshake validates.
+	cfg.Protocol = []string{"v1", wstunnelJWTPrefix + token}
+
+	clog("CARRIER dialing wss %s (fwd %s:%d)", dialURL, host, port)
+	ws, err := websocket.DialConfig(cfg)
+	if err != nil {
+		clog("CARRIER dial err: %v", err)
+		return nil, err
+	}
+	clog("CARRIER dial OK")
+	b.ws = ws
+	go b.readLoop(ws)
+	return ws, nil
+}
+
+// readLoop drains binary frames from one wss connection into recvCh until the
+// connection drops or the bind closes, then clears the cached conn so the next
+// send redials.
+func (b *fallbackBind) readLoop(ws *websocket.Conn) {
+	b.mu.Lock()
+	recvCh, closeCh := b.recvCh, b.closeCh
+	b.mu.Unlock()
+
+	for {
+		var data []byte
+		if err := websocket.Message.Receive(ws, &data); err != nil {
+			break
+		}
+		if len(data) == 0 {
+			continue
+		}
+		select {
+		case recvCh <- data:
+		case <-closeCh:
+			ws.Close()
+			return
+		}
+	}
+
+	b.mu.Lock()
+	if b.ws == ws {
+		b.ws = nil
+	}
+	b.mu.Unlock()
+	ws.Close()
+}
+
+// monitor drives the carrier switch. It prefers UDP and only falls back when
+// UDP has been silent past udpSilenceTimeout, periodically re-probing UDP so a
+// recovered network climbs back off the TCP fallback.
+func (b *fallbackBind) monitor() {
+	b.mu.Lock()
+	closeCh := b.closeCh
+	b.mu.Unlock()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	var tcpSince time.Time
+	for {
+		select {
+		case <-closeCh:
+			return
+		case now := <-ticker.C:
+			silent := now.Sub(time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano)))
+			switch atomic.LoadInt32(&b.mode) {
+			case carrierUDP:
+				if silent > udpSilenceTimeout {
+					atomic.StoreInt32(&b.mode, carrierTCP)
+					tcpSince = now
+					clog("CARRIER switch UDP->TCP (udp silent %v)", silent.Truncate(time.Millisecond))
+				}
+			case carrierTCP:
+				// Re-probe: drop back to UDP briefly; if packets resume we
+				// stay, otherwise the next tick re-falls back to TCP.
+				if now.Sub(tcpSince) > udpReprobeEvery {
+					atomic.StoreInt32(&b.mode, carrierUDP)
+					atomic.StoreInt64(&b.lastUDPRecvNano, now.Add(-udpSilenceTimeout+udpReprobeWindow).UnixNano())
+					tcpSince = now
+				}
+			}
+		}
+	}
+}
+
+// ParseEndpoint delegates to the inner UDP bind (the WG config Endpoint stays
+// the real server IP:port) and caches the result as the canonical endpoint for
+// TCP-delivered packets.
+func (b *fallbackBind) ParseEndpoint(s string) (conn.Endpoint, error) {
+	ep, err := b.inner.ParseEndpoint(s)
+	if err == nil && ep != nil {
+		b.canonEP.Store(ep)
+	}
+	return ep, err
+}
+
+// SetMark applies to the UDP path only; the wss carrier rides the OS default.
+func (b *fallbackBind) SetMark(mark uint32) error {
+	return b.inner.SetMark(mark)
+}
+
+// Close tears down the wss carrier and the inner UDP bind.
+func (b *fallbackBind) Close() error {
+	b.mu.Lock()
+	if !b.closed {
+		b.closed = true
+		if b.closeCh != nil {
+			close(b.closeCh)
+		}
+		if b.ws != nil {
+			b.ws.Close()
+			b.ws = nil
+		}
+	}
+	b.mu.Unlock()
+	return b.inner.Close()
+}
