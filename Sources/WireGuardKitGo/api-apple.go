@@ -25,7 +25,6 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -107,9 +106,14 @@ func wgTurnOn(settings *C.char, tunFd int32) int32 {
 		return -1
 	}
 	logger.Verbosef("Attaching to interface")
-	dev := device.NewDevice(tun, conn.NewStdNetBind(), logger)
+	// Carry the optional wss relay URL out-of-band in the settings string and
+	// strip it before IpcSet (wireguard-go rejects unknown UAPI keys). An empty
+	// URL yields the stock UDP-only bind.
+	relayURL, cleaned := SplitRelayEndpoint(C.GoString(settings))
+	carrierLogf = logger.Verbosef // route carrier lifecycle diagnostics to the WG log
+	dev := device.NewDevice(tun, NewFallbackBind(relayURL), logger)
 
-	err = dev.IpcSet(C.GoString(settings))
+	err = dev.IpcSet(cleaned)
 	if err != nil {
 		logger.Errorf("Unable to set IPC settings: %v", err)
 		unix.Close(dupTunFd)
