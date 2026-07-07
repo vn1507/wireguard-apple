@@ -53,6 +53,7 @@ func (l CLogger) Printf(format string, args ...interface{}) {
 type tunnelHandle struct {
 	*device.Device
 	*device.Logger
+	bind *fallbackBind // the UDP/wss carrier bind, for wgGetCarrierMode
 }
 
 var tunnelHandles = make(map[int32]tunnelHandle)
@@ -111,7 +112,8 @@ func wgTurnOn(settings *C.char, tunFd int32) int32 {
 	// URL yields the stock UDP-only bind.
 	relayURL, cleaned := SplitRelayEndpoint(C.GoString(settings))
 	carrierLogf = logger.Verbosef // route carrier lifecycle diagnostics to the WG log
-	dev := device.NewDevice(tun, NewFallbackBind(relayURL), logger)
+	bind := NewFallbackBind(relayURL)
+	dev := device.NewDevice(tun, bind, logger)
 
 	err = dev.IpcSet(cleaned)
 	if err != nil {
@@ -133,7 +135,8 @@ func wgTurnOn(settings *C.char, tunFd int32) int32 {
 		unix.Close(dupTunFd)
 		return -1
 	}
-	tunnelHandles[i] = tunnelHandle{dev, logger}
+	fb, _ := bind.(*fallbackBind) // always succeeds; kept for wgGetCarrierMode
+	tunnelHandles[i] = tunnelHandle{dev, logger, fb}
 	return i
 }
 
@@ -175,6 +178,15 @@ func wgGetConfig(tunnelHandle int32) *C.char {
 		return nil
 	}
 	return C.CString(settings)
+}
+
+//export wgGetCarrierMode
+func wgGetCarrierMode(tunnelHandle int32) int32 {
+	handle, ok := tunnelHandles[tunnelHandle]
+	if !ok || handle.bind == nil {
+		return -1 // no such tunnel / UDP-only build
+	}
+	return handle.bind.Mode() // 0 UDP, 1 TCP, 2 probe (on TCP data-plane)
 }
 
 //export wgBumpSockets

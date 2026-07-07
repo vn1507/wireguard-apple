@@ -66,8 +66,9 @@ func SplitRelayEndpoint(settings string) (relayURL, cleaned string) {
 
 // Carrier modes for fallbackBind.mode (accessed atomically).
 const (
-	carrierUDP int32 = iota
-	carrierTCP
+	carrierUDP   int32 = iota
+	carrierTCP         // all traffic over the wss carrier
+	carrierProbe       // TCP data-plane stays up while UDP is re-probed in parallel
 )
 
 // How long the bind tolerates UDP silence after Open before falling back to
@@ -102,6 +103,12 @@ type fallbackBind struct {
 
 	mode int32 // carrierUDP | carrierTCP (atomic)
 
+	// Diagnostic counters (atomic): datagrams pushed over / pulled from the wss
+	// carrier. monitor logs them once per second while on the TCP carrier to
+	// bisect one-way data loss (handshake ok but no traffic). TEMP.
+	sentTCP uint64
+	recvTCP uint64
+
 	// lastUDPRecvNano is the wall-clock time of the most recent inbound UDP
 	// packet (atomic). Stale-ness past udpSilenceTimeout triggers fallback.
 	lastUDPRecvNano int64
@@ -126,6 +133,14 @@ func NewFallbackBind(relayURL string) conn.Bind {
 		inner:    conn.NewStdNetBind(),
 		relayURL: relayURL,
 	}
+}
+
+// Mode returns the carrier the bind is currently sending on (carrierUDP,
+// carrierTCP, or carrierProbe), read atomically. The host app queries it through
+// the bridge (wgGetCarrierMode) to report the live transport — e.g. the relay's
+// TCP port instead of the bypassed UDP endpoint while on the wss carrier.
+func (b *fallbackBind) Mode() int32 {
+	return atomic.LoadInt32(&b.mode)
 }
 
 // Open delegates to the inner UDP bind, wraps its receive fns to track UDP
@@ -194,10 +209,20 @@ func (b *fallbackBind) receiveTCP(buf []byte) (int, conn.Endpoint, error) {
 
 // Send routes the packet over the carrier selected by the current mode.
 func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
-	if atomic.LoadInt32(&b.mode) == carrierTCP {
+	switch atomic.LoadInt32(&b.mode) {
+	case carrierTCP:
 		return b.sendTCP(buf)
+	case carrierProbe:
+		// Keep the real data flowing over TCP while speculatively re-probing
+		// UDP: a copy also goes out over UDP so that, if UDP has recovered, its
+		// replies refresh lastUDPRecvNano and monitor climbs back to the UDP
+		// carrier — WITHOUT ever blackholing live traffic into a still-blocked
+		// UDP path (which stalls the tunneled TCP for seconds every re-probe).
+		_ = b.inner.Send(buf, ep)
+		return b.sendTCP(buf)
+	default: // carrierUDP
+		return b.inner.Send(buf, ep)
 	}
-	return b.inner.Send(buf, ep)
 }
 
 // sendTCP lazily (re)establishes the wss carrier and writes one binary frame.
@@ -207,7 +232,12 @@ func (b *fallbackBind) sendTCP(buf []byte) error {
 		clog("CARRIER sendTCP ensureWS err: %v", err)
 		return err
 	}
-	return websocket.Message.Send(ws, buf)
+	if err := websocket.Message.Send(ws, buf); err != nil {
+		clog("CARRIER sendTCP write err: %v", err)
+		return err
+	}
+	atomic.AddUint64(&b.sentTCP, 1)
+	return nil
 }
 
 // wstunnel (Rust v10.x) handshake constants. The relay is a wstunnel server
@@ -348,6 +378,7 @@ func (b *fallbackBind) readLoop(ws *websocket.Conn) {
 		if len(data) == 0 {
 			continue
 		}
+		atomic.AddUint64(&b.recvTCP, 1)
 		select {
 		case recvCh <- data:
 		case <-closeCh:
@@ -375,26 +406,51 @@ func (b *fallbackBind) monitor() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	var tcpSince time.Time
+	var tcpSince, probeSince time.Time
+	var lastS, lastR uint64
 	for {
 		select {
 		case <-closeCh:
 			return
 		case now := <-ticker.C:
-			silent := now.Sub(time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano)))
-			switch atomic.LoadInt32(&b.mode) {
+			mode := atomic.LoadInt32(&b.mode)
+
+			// TEMP data-plane diagnostic: report carrier throughput whenever TCP
+			// carries data (plain TCP or the dual-send probe) so a one-way stall
+			// (handshake ok, no traffic) stays visible.
+			if mode == carrierTCP || mode == carrierProbe {
+				s, r := atomic.LoadUint64(&b.sentTCP), atomic.LoadUint64(&b.recvTCP)
+				if s != lastS || r != lastR {
+					clog("CARRIER tcp stats sent=%d recv=%d", s, r)
+					lastS, lastR = s, r
+				}
+			}
+
+			lastUDP := time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano))
+			switch mode {
 			case carrierUDP:
-				if silent > udpSilenceTimeout {
+				if now.Sub(lastUDP) > udpSilenceTimeout {
 					atomic.StoreInt32(&b.mode, carrierTCP)
 					tcpSince = now
-					clog("CARRIER switch UDP->TCP (udp silent %v)", silent.Truncate(time.Millisecond))
+					clog("CARRIER switch UDP->TCP (udp silent %v)", now.Sub(lastUDP).Truncate(time.Millisecond))
 				}
 			case carrierTCP:
-				// Re-probe: drop back to UDP briefly; if packets resume we
-				// stay, otherwise the next tick re-falls back to TCP.
+				// Periodically re-probe UDP, but non-destructively: enter the
+				// dual-send probe rather than diverting real data onto the
+				// (still-blocked) UDP path.
 				if now.Sub(tcpSince) > udpReprobeEvery {
+					atomic.StoreInt32(&b.mode, carrierProbe)
+					probeSince = now
+				}
+			case carrierProbe:
+				switch {
+				case lastUDP.After(probeSince):
+					// A UDP reply landed during the probe → UDP is back.
 					atomic.StoreInt32(&b.mode, carrierUDP)
-					atomic.StoreInt64(&b.lastUDPRecvNano, now.Add(-udpSilenceTimeout+udpReprobeWindow).UnixNano())
+					clog("CARRIER switch TCP->UDP (udp recovered)")
+				case now.Sub(probeSince) > udpReprobeWindow:
+					// UDP still dead; fall back to plain TCP until the next probe.
+					atomic.StoreInt32(&b.mode, carrierTCP)
 					tcpSince = now
 				}
 			}
