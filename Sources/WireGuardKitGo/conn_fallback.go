@@ -29,6 +29,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -93,6 +94,34 @@ func clog(format string, args ...interface{}) {
 	}
 }
 
+// carrierStateFn, when set by the bridge (wgSetCarrierStateFn), is notified when
+// the wss carrier gains or loses reachability. WG is connectionless and has no
+// "transport died" event of its own, so on the TCP carrier this is the one place
+// that knows: it lets the host surface a mid-session loss the way OpenVPN's
+// TRANSPORT_ERROR does. Guarded by carrierStateMu because the bridge clears it
+// on tunnel teardown while carrier goroutines may still be firing.
+var (
+	carrierStateMu sync.Mutex
+	carrierStateFn func(up bool)
+)
+
+func setCarrierStateFn(fn func(up bool)) {
+	carrierStateMu.Lock()
+	carrierStateFn = fn
+	carrierStateMu.Unlock()
+}
+
+// notifyCarrierState calls the host callback with carrierStateMu released: it
+// crosses into C++ and must not run while a bind lock is held.
+func notifyCarrierState(up bool) {
+	carrierStateMu.Lock()
+	fn := carrierStateFn
+	carrierStateMu.Unlock()
+	if fn != nil {
+		fn(up)
+	}
+}
+
 // fallbackBind implements conn.Bind. It embeds the stock UDP bind and adds one
 // wss carrier to a relay. Send() routes per the current mode; Receive() pulls
 // from whichever carrier delivered a packet (the UDP fns from the inner bind
@@ -103,15 +132,16 @@ type fallbackBind struct {
 
 	mode int32 // carrierUDP | carrierTCP (atomic)
 
-	// Diagnostic counters (atomic): datagrams pushed over / pulled from the wss
-	// carrier. monitor logs them once per second while on the TCP carrier to
-	// bisect one-way data loss (handshake ok but no traffic). TEMP.
-	sentTCP uint64
-	recvTCP uint64
-
 	// lastUDPRecvNano is the wall-clock time of the most recent inbound UDP
 	// packet (atomic). Stale-ness past udpSilenceTimeout triggers fallback.
 	lastUDPRecvNano int64
+
+	// carrierUp is 1 while the wss carrier is dialable, 0 once a redial failed
+	// (atomic). Only transitions are reported outward, so a carrier that drops
+	// and immediately redials stays invisible to the host — mirroring OpenVPN,
+	// where a transport error surfaces as RECONNECTING but a socket blip the
+	// core recovers from does not.
+	carrierUp int32
 
 	// canonEP is the peer endpoint parsed from the WG config. TCP-delivered
 	// packets are reported as coming from it so WG's roaming logic does not
@@ -159,6 +189,9 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.mu.Unlock()
 	atomic.StoreInt32(&b.mode, carrierUDP)
 	atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
+	// Start "up" so the first successful dial is a no-op rather than a spurious
+	// recovery event; only a failed dial moves this to down.
+	atomic.StoreInt32(&b.carrierUp, 1)
 
 	fns := make([]conn.ReceiveFunc, 0, len(innerFns)+1)
 	for _, fn := range innerFns {
@@ -236,7 +269,6 @@ func (b *fallbackBind) sendTCP(buf []byte) error {
 		clog("CARRIER sendTCP write err: %v", err)
 		return err
 	}
-	atomic.AddUint64(&b.sentTCP, 1)
 	return nil
 }
 
@@ -324,6 +356,34 @@ func parseRelay(relayURL string) (dialURL, host string, port uint16, origin stri
 // ensureWS returns the live wss connection, dialing (and starting the reader
 // goroutine) on first use or after a drop. Caller-agnostic to mode.
 func (b *fallbackBind) ensureWS() (*websocket.Conn, error) {
+	ws, err := b.dialWS()
+	// A closed bind is teardown, not a transport failure: stay quiet so stop()
+	// never looks like a mid-session drop to the host.
+	if err != nil && errors.Is(err, net.ErrClosed) {
+		return nil, err
+	}
+	// Reported here, outside dialWS's b.mu: the host callback crosses into C++
+	// and must never run under a bind lock.
+	b.setCarrierUp(err == nil)
+	return ws, err
+}
+
+// setCarrierUp records carrier reachability and notifies the host only when it
+// changes, so a per-packet redial storm yields one event instead of thousands.
+func (b *fallbackBind) setCarrierUp(up bool) {
+	var v int32
+	if up {
+		v = 1
+	}
+	if atomic.SwapInt32(&b.carrierUp, v) == v {
+		return
+	}
+	clog("CARRIER reachability -> up=%v", up)
+	notifyCarrierState(up)
+}
+
+// dialWS returns the cached wss conn, dialling one if needed. Holds b.mu.
+func (b *fallbackBind) dialWS() (*websocket.Conn, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
@@ -378,7 +438,6 @@ func (b *fallbackBind) readLoop(ws *websocket.Conn) {
 		if len(data) == 0 {
 			continue
 		}
-		atomic.AddUint64(&b.recvTCP, 1)
 		select {
 		case recvCh <- data:
 		case <-closeCh:
@@ -407,24 +466,12 @@ func (b *fallbackBind) monitor() {
 	defer ticker.Stop()
 
 	var tcpSince, probeSince time.Time
-	var lastS, lastR uint64
 	for {
 		select {
 		case <-closeCh:
 			return
 		case now := <-ticker.C:
 			mode := atomic.LoadInt32(&b.mode)
-
-			// TEMP data-plane diagnostic: report carrier throughput whenever TCP
-			// carries data (plain TCP or the dual-send probe) so a one-way stall
-			// (handshake ok, no traffic) stays visible.
-			if mode == carrierTCP || mode == carrierProbe {
-				s, r := atomic.LoadUint64(&b.sentTCP), atomic.LoadUint64(&b.recvTCP)
-				if s != lastS || r != lastR {
-					clog("CARRIER tcp stats sent=%d recv=%d", s, r)
-					lastS, lastR = s, r
-				}
-			}
 
 			lastUDP := time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano))
 			switch mode {

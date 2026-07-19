@@ -6,10 +6,15 @@
 package main
 
 // #include <stdlib.h>
+// #include <stdint.h>
 // #include <sys/types.h>
 // static void callLogger(void *func, void *ctx, int level, const char *msg)
 // {
 // 	((void(*)(void *, int, const char *))func)(ctx, level, msg);
+// }
+// static void callCarrierState(void *func, void *ctx, int32_t up)
+// {
+// 	((void(*)(void *, int32_t))func)(ctx, up);
 // }
 import "C"
 
@@ -80,6 +85,29 @@ func init() {
 func wgSetLogger(context, loggerFn uintptr) {
 	loggerCtx = unsafe.Pointer(context)
 	loggerFunc = unsafe.Pointer(loggerFn)
+}
+
+// wgSetCarrierStateFn installs the host callback the wss carrier notifies when
+// it loses or regains reachability (up=0/1). WG has no transport-down event of
+// its own, so this is what lets the host emit RECONNECTING mid-session. Pass a
+// null fn to unregister — the host MUST do so before tearing the tunnel down,
+// since carrier goroutines can fire right up until wgTurnOff returns.
+//
+//export wgSetCarrierStateFn
+func wgSetCarrierStateFn(context, fn uintptr) {
+	if fn == 0 {
+		setCarrierStateFn(nil)
+		return
+	}
+	ctxPtr := unsafe.Pointer(context)
+	fnPtr := unsafe.Pointer(fn)
+	setCarrierStateFn(func(up bool) {
+		var v C.int32_t
+		if up {
+			v = 1
+		}
+		C.callCarrierState(fnPtr, ctxPtr, v)
+	})
 }
 
 //export wgTurnOn
