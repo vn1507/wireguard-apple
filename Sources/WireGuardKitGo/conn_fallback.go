@@ -82,6 +82,15 @@ const (
 	udpReprobeWindow  = 5 * time.Second
 )
 
+// carrierDownReportEvery throttles how often a persistently-failing carrier is
+// reported "down". The carrier already re-dials on the Send path (ensureWS), so
+// no separate retry loop is needed; this only rate-limits the reporting so a
+// per-packet redial storm in TCP mode becomes a countable cadence — one "down"
+// per interval — instead of thousands of events. Each report is one RECONNECTING
+// the host counts against its reconnect budget (the analog of the ovpn3 core's
+// RECONNECTING interval), so this interval times the host's give-up.
+const carrierDownReportEvery = 5 * time.Second
+
 // carrierLogf, when set by the bridge (wgTurnOn) to the device's Verbosef,
 // receives carrier lifecycle diagnostics (dial, UDP<->TCP switch, dial errors).
 // nil keeps the carrier silent. Intentionally NOT per-packet — that would spam
@@ -136,12 +145,17 @@ type fallbackBind struct {
 	// packet (atomic). Stale-ness past udpSilenceTimeout triggers fallback.
 	lastUDPRecvNano int64
 
-	// carrierUp is 1 while the wss carrier is dialable, 0 once a redial failed
-	// (atomic). Only transitions are reported outward, so a carrier that drops
-	// and immediately redials stays invisible to the host — mirroring OpenVPN,
-	// where a transport error surfaces as RECONNECTING but a socket blip the
-	// core recovers from does not.
+	// carrierUp is 1 while the wss carrier last dialed successfully, 0 once a dial
+	// failed (atomic). The up<->down edges gate reporting: recovery is reported
+	// once (not per surviving packet), and lastDownReportNano throttles the
+	// repeated "down" side.
 	carrierUp int32
+
+	// lastDownReportNano is when the carrier was last reported "down" (atomic).
+	// While the carrier stays down, ensureWS is hit on the Send path far faster
+	// than we want to count retries, so reports are throttled to one per
+	// carrierDownReportEvery — see reportCarrier.
+	lastDownReportNano int64
 
 	// canonEP is the peer endpoint parsed from the WG config. TCP-delivered
 	// packets are reported as coming from it so WG's roaming logic does not
@@ -189,9 +203,10 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.mu.Unlock()
 	atomic.StoreInt32(&b.mode, carrierUDP)
 	atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
-	// Start "up" so the first successful dial is a no-op rather than a spurious
-	// recovery event; only a failed dial moves this to down.
+	// Start "up" so the first failed dial registers as a genuine down edge and is
+	// reported immediately; later downs are throttled.
 	atomic.StoreInt32(&b.carrierUp, 1)
+	atomic.StoreInt64(&b.lastDownReportNano, 0)
 
 	fns := make([]conn.ReceiveFunc, 0, len(innerFns)+1)
 	for _, fn := range innerFns {
@@ -354,7 +369,10 @@ func parseRelay(relayURL string) (dialURL, host string, port uint16, origin stri
 }
 
 // ensureWS returns the live wss connection, dialing (and starting the reader
-// goroutine) on first use or after a drop. Caller-agnostic to mode.
+// goroutine) on first use or after a drop. Caller-agnostic to mode. The dial
+// result is the carrier's reachability, reported (throttled) to the host from
+// here — the Send path is the natural place the carrier re-dials, so no separate
+// retry loop is needed.
 func (b *fallbackBind) ensureWS() (*websocket.Conn, error) {
 	ws, err := b.dialWS()
 	// A closed bind is teardown, not a transport failure: stay quiet so stop()
@@ -364,22 +382,36 @@ func (b *fallbackBind) ensureWS() (*websocket.Conn, error) {
 	}
 	// Reported here, outside dialWS's b.mu: the host callback crosses into C++
 	// and must never run under a bind lock.
-	b.setCarrierUp(err == nil)
+	b.reportCarrier(err == nil)
 	return ws, err
 }
 
-// setCarrierUp records carrier reachability and notifies the host only when it
-// changes, so a per-packet redial storm yields one event instead of thousands.
-func (b *fallbackBind) setCarrierUp(up bool) {
-	var v int32
+// reportCarrier notifies the host of carrier reachability, gated so the counting
+// on the C++ side is meaningful. Recovery (up) is reported once on the down->up
+// edge. Loss (down) is reported immediately on the up->down edge and then at most
+// once per carrierDownReportEvery for as long as it stays down: because ensureWS
+// is on the per-packet Send path, an unthrottled "down" would fire thousands of
+// times a second and blow through the host's retry budget instantly, whereas one
+// report per interval is the countable RECONNECTING cadence the host expects.
+func (b *fallbackBind) reportCarrier(up bool) {
 	if up {
-		v = 1
-	}
-	if atomic.SwapInt32(&b.carrierUp, v) == v {
+		if atomic.SwapInt32(&b.carrierUp, 1) == 0 {
+			clog("CARRIER reachability -> up")
+			notifyCarrierState(true)
+		}
 		return
 	}
-	clog("CARRIER reachability -> up=%v", up)
-	notifyCarrierState(up)
+
+	edge := atomic.SwapInt32(&b.carrierUp, 0) == 1 // first failure after being up
+	now := time.Now().UnixNano()
+	if !edge {
+		if last := atomic.LoadInt64(&b.lastDownReportNano); now-last < int64(carrierDownReportEvery) {
+			return // throttle: still down, reported recently
+		}
+	}
+	atomic.StoreInt64(&b.lastDownReportNano, now)
+	clog("CARRIER reachability -> down")
+	notifyCarrierState(false)
 }
 
 // dialWS returns the cached wss conn, dialling one if needed. Holds b.mu.
