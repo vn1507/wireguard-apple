@@ -82,14 +82,21 @@ const (
 	udpReprobeWindow  = 5 * time.Second
 )
 
-// carrierDownReportEvery throttles how often a persistently-failing carrier is
-// reported "down". The carrier already re-dials on the Send path (ensureWS), so
-// no separate retry loop is needed; this only rate-limits the reporting so a
-// per-packet redial storm in TCP mode becomes a countable cadence — one "down"
-// per interval — instead of thousands of events. Each report is one RECONNECTING
-// the host counts against its reconnect budget (the analog of the ovpn3 core's
-// RECONNECTING interval), so this interval times the host's give-up.
-const carrierDownReportEvery = 5 * time.Second
+// carrierRetryInterval is how long a failed carrier waits before the next redial
+// attempt — the analog of the ovpn3 core's reconnect interval, which is what
+// paces the RECONNECTING events the host counts (OVPNClientImpl::stateEvent).
+//
+// It is load-bearing twice over. Without it, dialWS is on the per-packet Send
+// path, so a down carrier would attempt a full TCP+TLS+WS handshake for every
+// outbound WireGuard packet — a dial storm that also serialises Send behind a
+// blocking dial, since dialWS holds mu. And because each real attempt is
+// reported exactly once, this interval is also what makes the host's retry
+// budget (WGClientImpl::m_reconnectCountDown vs m_maxReconnectAttempts) count
+// attempts rather than packets.
+//
+// Keep in sync with CarrierCountSpacing in wgclientimpl.cpp, which must stay
+// strictly below it.
+const carrierRetryInterval = 5 * time.Second
 
 // carrierLogf, when set by the bridge (wgTurnOn) to the device's Verbosef,
 // receives carrier lifecycle diagnostics (dial, UDP<->TCP switch, dial errors).
@@ -146,16 +153,17 @@ type fallbackBind struct {
 	lastUDPRecvNano int64
 
 	// carrierUp is 1 while the wss carrier last dialed successfully, 0 once a dial
-	// failed (atomic). The up<->down edges gate reporting: recovery is reported
-	// once (not per surviving packet), and lastDownReportNano throttles the
-	// repeated "down" side.
+	// failed (atomic). The up edge gates reporting so recovery is reported once,
+	// not per surviving packet.
 	carrierUp int32
 
-	// lastDownReportNano is when the carrier was last reported "down" (atomic).
-	// While the carrier stays down, ensureWS is hit on the Send path far faster
-	// than we want to count retries, so reports are throttled to one per
-	// carrierDownReportEvery — see reportCarrier.
-	lastDownReportNano int64
+	// lastDialFail is when the most recent dial attempt failed, and lastDialErr
+	// what it failed with. Together they pace retries to one per
+	// carrierRetryInterval: until it elapses, dialWS hands back lastDialErr
+	// without touching the network. Guarded by mu (written and read only inside
+	// dialWS), unlike the atomics above.
+	lastDialFail time.Time
+	lastDialErr  error
 
 	// canonEP is the peer endpoint parsed from the WG config. TCP-delivered
 	// packets are reported as coming from it so WG's roaming logic does not
@@ -200,13 +208,15 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.closed = false
 	b.recvCh = make(chan []byte, 128)
 	b.closeCh = make(chan struct{})
+	// Clear any pacing left by a previous session so this one's first dial is
+	// attempted immediately rather than replaying a stale failure.
+	b.lastDialFail = time.Time{}
+	b.lastDialErr = nil
 	b.mu.Unlock()
 	atomic.StoreInt32(&b.mode, carrierUDP)
 	atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
-	// Start "up" so the first failed dial registers as a genuine down edge and is
-	// reported immediately; later downs are throttled.
+	// Start "up" so the first failed dial registers as a genuine down edge.
 	atomic.StoreInt32(&b.carrierUp, 1)
-	atomic.StoreInt64(&b.lastDownReportNano, 0)
 
 	fns := make([]conn.ReceiveFunc, 0, len(innerFns)+1)
 	for _, fn := range innerFns {
@@ -369,30 +379,32 @@ func parseRelay(relayURL string) (dialURL, host string, port uint16, origin stri
 }
 
 // ensureWS returns the live wss connection, dialing (and starting the reader
-// goroutine) on first use or after a drop. Caller-agnostic to mode. The dial
-// result is the carrier's reachability, reported (throttled) to the host from
-// here — the Send path is the natural place the carrier re-dials, so no separate
-// retry loop is needed.
+// goroutine) on first use or after a drop. Caller-agnostic to mode. The Send
+// path is the natural place the carrier re-dials, so no separate retry loop is
+// needed; dialWS paces the attempts and each real one is reported to the host as
+// exactly one retry.
 func (b *fallbackBind) ensureWS() (*websocket.Conn, error) {
-	ws, err := b.dialWS()
+	ws, attempted, err := b.dialWS()
 	// A closed bind is teardown, not a transport failure: stay quiet so stop()
 	// never looks like a mid-session drop to the host.
 	if err != nil && errors.Is(err, net.ErrClosed) {
 		return nil, err
 	}
 	// Reported here, outside dialWS's b.mu: the host callback crosses into C++
-	// and must never run under a bind lock.
-	b.reportCarrier(err == nil)
+	// and must never run under a bind lock. Only real attempts are reported —
+	// suppressed ones would put the host back to counting packets.
+	if attempted {
+		b.reportCarrier(err == nil)
+	}
 	return ws, err
 }
 
-// reportCarrier notifies the host of carrier reachability, gated so the counting
-// on the C++ side is meaningful. Recovery (up) is reported once on the down->up
-// edge. Loss (down) is reported immediately on the up->down edge and then at most
-// once per carrierDownReportEvery for as long as it stays down: because ensureWS
-// is on the per-packet Send path, an unthrottled "down" would fire thousands of
-// times a second and blow through the host's retry budget instantly, whereas one
-// report per interval is the countable RECONNECTING cadence the host expects.
+// reportCarrier notifies the host of the outcome of one carrier dial attempt.
+// Callers must invoke it once per real attempt and never for a suppressed one:
+// dialWS already paces attempts to carrierRetryInterval, so no throttle is
+// needed here and one "down" is one RECONNECTING for the host to count.
+// Recovery (up) is still edge-gated, since a live carrier returns its cached
+// conn without dialing and the surviving attempts would otherwise re-report it.
 func (b *fallbackBind) reportCarrier(up bool) {
 	if up {
 		if atomic.SwapInt32(&b.carrierUp, 1) == 0 {
@@ -402,41 +414,53 @@ func (b *fallbackBind) reportCarrier(up bool) {
 		return
 	}
 
-	edge := atomic.SwapInt32(&b.carrierUp, 0) == 1 // first failure after being up
-	now := time.Now().UnixNano()
-	if !edge {
-		if last := atomic.LoadInt64(&b.lastDownReportNano); now-last < int64(carrierDownReportEvery) {
-			return // throttle: still down, reported recently
-		}
-	}
-	atomic.StoreInt64(&b.lastDownReportNano, now)
+	atomic.StoreInt32(&b.carrierUp, 0)
 	clog("CARRIER reachability -> down")
 	notifyCarrierState(false)
 }
 
-// dialWS returns the cached wss conn, dialling one if needed. Holds b.mu.
-func (b *fallbackBind) dialWS() (*websocket.Conn, error) {
+// dialWS returns the cached wss conn, dialling one if needed. Holds b.mu. The
+// bool reports whether this call made a real dial attempt: false means the conn
+// was already up, the bind is closing, or the attempt was suppressed by
+// carrierRetryInterval — none of which the host should count as a retry.
+func (b *fallbackBind) dialWS() (*websocket.Conn, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
-		return nil, net.ErrClosed
+		return nil, false, net.ErrClosed
 	}
 	if b.ws != nil {
-		return b.ws, nil
+		return b.ws, false, nil
+	}
+
+	// Pace the retries: until carrierRetryInterval has elapsed since the last
+	// failure, replay that failure instead of dialing. attempted=false keeps the
+	// suppressed calls out of the host's retry count, so the budget counts
+	// attempts and not packets.
+	if b.lastDialErr != nil && time.Since(b.lastDialFail) < carrierRetryInterval {
+		return nil, false, b.lastDialErr
+	}
+
+	// From here on every exit is a real attempt: record its outcome so the next
+	// caller is paced against this one.
+	fail := func(err error) (*websocket.Conn, bool, error) {
+		b.lastDialFail = time.Now()
+		b.lastDialErr = err
+		return nil, true, err
 	}
 
 	dialURL, host, port, origin, err := parseRelay(b.relayURL)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	token, err := buildWstunnelToken(host, port)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 
 	cfg, err := websocket.NewConfig(dialURL, origin)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	// Sec-WebSocket-Protocol: v1, authorization.bearer.<jwt> — the server
 	// returns "v1", matching config.Protocol[0] so the handshake validates.
@@ -446,12 +470,13 @@ func (b *fallbackBind) dialWS() (*websocket.Conn, error) {
 	ws, err := websocket.DialConfig(cfg)
 	if err != nil {
 		clog("CARRIER dial err: %v", err)
-		return nil, err
+		return fail(err)
 	}
 	clog("CARRIER dial OK")
+	b.lastDialErr = nil
 	b.ws = ws
 	go b.readLoop(ws)
-	return ws, nil
+	return ws, true, nil
 }
 
 // readLoop drains binary frames from one wss connection into recvCh until the
