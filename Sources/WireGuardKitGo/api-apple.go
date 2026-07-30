@@ -16,6 +16,10 @@ package main
 // {
 // 	((void(*)(void *, int32_t))func)(ctx, up);
 // }
+// static void callHandshakeState(void *func, void *ctx, int32_t up)
+// {
+// 	((void(*)(void *, int32_t))func)(ctx, up);
+// }
 import "C"
 
 import (
@@ -26,6 +30,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -49,10 +54,64 @@ func cstring(s string) *C.char {
 }
 
 func (l CLogger) Printf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	// The device has no C-facing handshake event, so we tap its own log stream
+	// (every Verbosef line, level 0, funnels through here) for the two moments
+	// the UDP-only reconnection reaction needs. Done before the loggerFunc guard
+	// so it fires even when the host set no logger.
+	if l == 0 {
+		classifyHandshake(msg)
+	}
 	if uintptr(loggerFunc) == 0 {
 		return
 	}
-	C.callLogger(loggerFunc, loggerCtx, C.int(l), cstring(fmt.Sprintf(format, args...)))
+	C.callLogger(loggerFunc, loggerCtx, C.int(l), cstring(msg))
+}
+
+// classifyHandshake turns wireguard-go's own timer log lines into a liveness
+// push for the host. The strings are stable for the pinned device version:
+//   - "Received handshake response" (receive.go) is exactly timersHandshakeComplete
+//     for the initiator — the path is alive again → up.
+//   - "giving up" (timers.go, after RekeyAttemptTime) is WG's own verdict that the
+//     handshake will not complete — the session is dead → down. It respects the
+//     tx gate for free: with no outbound traffic WG never initiates, so it never
+//     gives up on an idle tunnel.
+//
+// TestHandshakeLogStringsPresent guards these against a device bump.
+func classifyHandshake(msg string) {
+	switch {
+	case strings.Contains(msg, "Received handshake response"):
+		notifyHandshakeState(true)
+	case strings.Contains(msg, "giving up"):
+		notifyHandshakeState(false)
+	}
+}
+
+// handshakeStateFn, when set by the bridge (wgSetHandshakeStateFn), is the host's
+// liveness push for the UDP-only case (no carrier). Mirrors carrierStateFn;
+// guarded by handshakeStateMu because the bridge clears it on tunnel teardown
+// while device timer goroutines may still be logging.
+var (
+	handshakeStateMu sync.Mutex
+	handshakeStateFn func(up bool)
+)
+
+func setHandshakeStateFn(fn func(up bool)) {
+	handshakeStateMu.Lock()
+	handshakeStateFn = fn
+	handshakeStateMu.Unlock()
+}
+
+// notifyHandshakeState calls the host callback with handshakeStateMu released.
+// The callback only queues onto the host's runloop (never blocks), so firing it
+// from inside a device timer log call cannot deadlock against a device lock.
+func notifyHandshakeState(up bool) {
+	handshakeStateMu.Lock()
+	fn := handshakeStateFn
+	handshakeStateMu.Unlock()
+	if fn != nil {
+		fn(up)
+	}
 }
 
 type tunnelHandle struct {
@@ -107,6 +166,23 @@ func wgSetCarrierStateFn(context, fn uintptr) {
 			v = 1
 		}
 		C.callCarrierState(fnPtr, ctxPtr, v)
+	})
+}
+
+//export wgSetHandshakeStateFn
+func wgSetHandshakeStateFn(context, fn uintptr) {
+	if fn == 0 {
+		setHandshakeStateFn(nil)
+		return
+	}
+	ctxPtr := unsafe.Pointer(context)
+	fnPtr := unsafe.Pointer(fn)
+	setHandshakeStateFn(func(up bool) {
+		var v C.int32_t
+		if up {
+			v = 1
+		}
+		C.callHandshakeState(fnPtr, ctxPtr, v)
 	})
 }
 

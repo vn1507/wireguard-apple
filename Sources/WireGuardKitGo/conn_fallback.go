@@ -41,6 +41,7 @@ import (
 
 	"golang.org/x/net/websocket"
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/device"
 )
 
 // relayEndpointKey is the non-standard UAPI line the C++ side emits to carry
@@ -94,9 +95,12 @@ const (
 // budget (WGClientImpl::m_reconnectCountDown vs m_maxReconnectAttempts) count
 // attempts rather than packets.
 //
-// Keep in sync with CarrierCountSpacing in wgclientimpl.cpp, which must stay
-// strictly below it.
-const carrierRetryInterval = 5 * time.Second
+// Anchored to WireGuard's own handshake-retry cadence rather than a copied
+// literal: it IS device.RekeyTimeout (5s), the same value the host's shared
+// reconnect quantum uses (wg::timers::RetryInterval in wgtimers.h, mirrored by
+// kCarrierRetryInterval on Windows and carrierRetryInterval in wg-carrier), so
+// the retry budget counts at one rate on every path.
+const carrierRetryInterval = device.RekeyTimeout
 
 // carrierLogf, when set by the bridge (wgTurnOn) to the device's Verbosef,
 // receives carrier lifecycle diagnostics (dial, UDP<->TCP switch, dial errors).
