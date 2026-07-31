@@ -18,6 +18,13 @@ extern void wgSetLogger(void *context, logger_fn_t logger_fn);
  * NULL fn to unregister, which the host must do before wgTurnOff. */
 typedef void(*carrier_state_fn_t)(void *context, int32_t up);
 extern void wgSetCarrierStateFn(void *context, carrier_state_fn_t fn);
+
+/* UDP-only liveness push: wireguard-go sniffs its own handshake log and reports
+ * WG's handshake-complete (up=1) / gave-up-after-RekeyAttemptTime (up=0). Same
+ * contract as carrier_state_fn_t (foreign goroutine, NULL to unregister before
+ * wgTurnOff); it is what makes the no-carrier path event-driven. */
+typedef void(*handshake_state_fn_t)(void *context, int32_t up);
+extern void wgSetHandshakeStateFn(void *context, handshake_state_fn_t fn);
 extern int wgTurnOn(const char *settings, int32_t tun_fd);
 extern void wgTurnOff(int handle);
 extern int64_t wgSetConfig(int handle, const char *settings);
