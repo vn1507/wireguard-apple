@@ -78,7 +78,7 @@ const (
 // the preferred carrier — TCP is a fallback only (TCP-over-TCP degrades under
 // loss), so we keep trying to climb back to UDP.
 const (
-	udpSilenceTimeout = 8 * time.Second
+	udpSilenceTimeout = 25 * time.Second
 	udpReprobeEvery   = 30 * time.Second
 	udpReprobeWindow  = 5 * time.Second
 )
@@ -156,6 +156,14 @@ type fallbackBind struct {
 	// packet (atomic). Stale-ness past udpSilenceTimeout triggers fallback.
 	lastUDPRecvNano int64
 
+	// lastUDPSendNano is the wall-clock time of the most recent outbound UDP
+	// packet (atomic). The monitor only counts inbound silence as a dead path
+	// when we have actually sent over UDP since the last inbound packet
+	// (lastUDPSendNano > lastUDPRecvNano), mirroring the C++ watchdog's
+	// txAdvanced gate: an idle tunnel with no traffic and no PersistentKeepalive
+	// legitimately goes quiet and must not flap onto the TCP carrier.
+	lastUDPSendNano int64
+
 	// carrierUp is 1 while the wss carrier last dialed successfully, 0 once a dial
 	// failed (atomic). The up edge gates reporting so recovery is reported once,
 	// not per surviving packet.
@@ -219,6 +227,9 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.mu.Unlock()
 	atomic.StoreInt32(&b.mode, carrierUDP)
 	atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
+	// Seed send strictly before recv so a fresh session never trips the monitor
+	// until we have actually sent something over UDP this session.
+	atomic.StoreInt64(&b.lastUDPSendNano, 0)
 	// Start "up" so the first failed dial registers as a genuine down edge.
 	atomic.StoreInt32(&b.carrierUp, 1)
 
@@ -269,6 +280,27 @@ func (b *fallbackBind) receiveTCP(buf []byte) (int, conn.Endpoint, error) {
 	}
 }
 
+// noteUDPSend records an outbound UDP packet for the liveness monitor, but only
+// for packets that warrant a reply. WireGuard keepalives are one-way (the peer
+// never answers them), so counting our own keepalive as "we are using the path"
+// would let an otherwise idle tunnel — whose sole egress is its keepalives —
+// falsely trip the UDP->TCP switch. This makes the client robust whether or not
+// the server is configured to send keepalives back: handshakes and real data
+// still arm the detector, so a genuinely blocked path (we keep sending, nothing
+// comes back) is still caught.
+func (b *fallbackBind) noteUDPSend(buf []byte) {
+	// A keepalive is a transport-data message (type 4, so buf[0]==4 in the
+	// little-endian type word) with an empty payload: 16-byte transport header +
+	// 16-byte Poly1305 tag = 32 bytes exactly. The smallest real data packet is
+	// 48 bytes and handshakes are 148/92/64, so length alone disambiguates.
+	const messageTransport = 4
+	const keepaliveSize = 32
+	if len(buf) == keepaliveSize && buf[0] == messageTransport {
+		return
+	}
+	atomic.StoreInt64(&b.lastUDPSendNano, time.Now().UnixNano())
+}
+
 // Send routes the packet over the carrier selected by the current mode.
 func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
 	switch atomic.LoadInt32(&b.mode) {
@@ -280,9 +312,11 @@ func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
 		// replies refresh lastUDPRecvNano and monitor climbs back to the UDP
 		// carrier — WITHOUT ever blackholing live traffic into a still-blocked
 		// UDP path (which stalls the tunneled TCP for seconds every re-probe).
+		b.noteUDPSend(buf)
 		_ = b.inner.Send(buf, ep)
 		return b.sendTCP(buf)
 	default: // carrierUDP
+		b.noteUDPSend(buf)
 		return b.inner.Send(buf, ep)
 	}
 }
@@ -537,7 +571,14 @@ func (b *fallbackBind) monitor() {
 			lastUDP := time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano))
 			switch mode {
 			case carrierUDP:
-				if now.Sub(lastUDP) > udpSilenceTimeout {
+				lastSend := time.Unix(0, atomic.LoadInt64(&b.lastUDPSendNano))
+				// Only a path we are actively using can be declared dead: require
+				// an outbound UDP packet since the last inbound one (lastSend >
+				// lastUDP). This mirrors the C++ watchdog's txAdvanced gate — an
+				// idle tunnel sends nothing, so it never trips this even past
+				// udpSilenceTimeout, while a real block (we keep sending handshake
+				// initiations, nothing comes back) does.
+				if lastSend.After(lastUDP) && now.Sub(lastUDP) > udpSilenceTimeout {
 					atomic.StoreInt32(&b.mode, carrierTCP)
 					tcpSince = now
 					clog("CARRIER switch UDP->TCP (udp silent %v)", now.Sub(lastUDP).Truncate(time.Millisecond))
