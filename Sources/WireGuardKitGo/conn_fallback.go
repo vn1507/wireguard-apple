@@ -557,15 +557,39 @@ func (b *fallbackBind) monitor() {
 	closeCh := b.closeCh
 	b.mu.Unlock()
 
-	ticker := time.NewTicker(time.Second)
+	const tickEvery = time.Second
+	// A gap between ticks far larger than tickEvery means this goroutine was not
+	// running — system sleep/suspend (or a severe scheduling stall). The
+	// WireGuardKitGo runtime's boottime patch makes the clock advance across
+	// sleep so WG's own protocol timers expire correctly, but it also means the
+	// silence we "observe" on the first post-wake tick is time we never actually
+	// watched the path, not evidence UDP is dead. Re-baseline the liveness clock
+	// on such a tick instead of switching, giving UDP a fresh udpSilenceTimeout
+	// to prove itself after wake.
+	const wakeResyncGap = 3 * time.Second
+
+	ticker := time.NewTicker(tickEvery)
 	defer ticker.Stop()
 
 	var tcpSince, probeSince time.Time
+	prevTick := time.Now()
 	for {
 		select {
 		case <-closeCh:
 			return
 		case now := <-ticker.C:
+			if now.Sub(prevTick) > wakeResyncGap {
+				// Suspended since the last tick: the accumulated silence is not
+				// ours to trust. Reset the UDP baseline (send strictly before
+				// recv, mirroring Open) and skip this tick's verdict so a real
+				// post-wake block is still caught one udpSilenceTimeout later.
+				atomic.StoreInt64(&b.lastUDPSendNano, 0)
+				atomic.StoreInt64(&b.lastUDPRecvNano, now.UnixNano())
+				prevTick = now
+				continue
+			}
+			prevTick = now
+
 			mode := atomic.LoadInt32(&b.mode)
 
 			lastUDP := time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano))
