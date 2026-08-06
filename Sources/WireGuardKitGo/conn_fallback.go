@@ -41,6 +41,7 @@ import (
 
 	"golang.org/x/net/websocket"
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/device"
 )
 
 // relayEndpointKey is the non-standard UAPI line the C++ side emits to carry
@@ -77,7 +78,7 @@ const (
 // the preferred carrier — TCP is a fallback only (TCP-over-TCP degrades under
 // loss), so we keep trying to climb back to UDP.
 const (
-	udpSilenceTimeout = 8 * time.Second
+	udpSilenceTimeout = 25 * time.Second
 	udpReprobeEvery   = 30 * time.Second
 	udpReprobeWindow  = 5 * time.Second
 )
@@ -94,9 +95,12 @@ const (
 // budget (WGClientImpl::m_reconnectCountDown vs m_maxReconnectAttempts) count
 // attempts rather than packets.
 //
-// Keep in sync with CarrierCountSpacing in wgclientimpl.cpp, which must stay
-// strictly below it.
-const carrierRetryInterval = 5 * time.Second
+// Anchored to WireGuard's own handshake-retry cadence rather than a copied
+// literal: it IS device.RekeyTimeout (5s), the same value the host's shared
+// reconnect quantum uses (wg::timers::RetryInterval in wgtimers.h, mirrored by
+// kCarrierRetryInterval on Windows and carrierRetryInterval in wg-carrier), so
+// the retry budget counts at one rate on every path.
+const carrierRetryInterval = device.RekeyTimeout
 
 // carrierLogf, when set by the bridge (wgTurnOn) to the device's Verbosef,
 // receives carrier lifecycle diagnostics (dial, UDP<->TCP switch, dial errors).
@@ -151,6 +155,14 @@ type fallbackBind struct {
 	// lastUDPRecvNano is the wall-clock time of the most recent inbound UDP
 	// packet (atomic). Stale-ness past udpSilenceTimeout triggers fallback.
 	lastUDPRecvNano int64
+
+	// lastUDPSendNano is the wall-clock time of the most recent outbound UDP
+	// packet (atomic). The monitor only counts inbound silence as a dead path
+	// when we have actually sent over UDP since the last inbound packet
+	// (lastUDPSendNano > lastUDPRecvNano), mirroring the C++ watchdog's
+	// txAdvanced gate: an idle tunnel with no traffic and no PersistentKeepalive
+	// legitimately goes quiet and must not flap onto the TCP carrier.
+	lastUDPSendNano int64
 
 	// carrierUp is 1 while the wss carrier last dialed successfully, 0 once a dial
 	// failed (atomic). The up edge gates reporting so recovery is reported once,
@@ -215,6 +227,9 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.mu.Unlock()
 	atomic.StoreInt32(&b.mode, carrierUDP)
 	atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
+	// Seed send strictly before recv so a fresh session never trips the monitor
+	// until we have actually sent something over UDP this session.
+	atomic.StoreInt64(&b.lastUDPSendNano, 0)
 	// Start "up" so the first failed dial registers as a genuine down edge.
 	atomic.StoreInt32(&b.carrierUp, 1)
 
@@ -265,6 +280,27 @@ func (b *fallbackBind) receiveTCP(buf []byte) (int, conn.Endpoint, error) {
 	}
 }
 
+// noteUDPSend records an outbound UDP packet for the liveness monitor, but only
+// for packets that warrant a reply. WireGuard keepalives are one-way (the peer
+// never answers them), so counting our own keepalive as "we are using the path"
+// would let an otherwise idle tunnel — whose sole egress is its keepalives —
+// falsely trip the UDP->TCP switch. This makes the client robust whether or not
+// the server is configured to send keepalives back: handshakes and real data
+// still arm the detector, so a genuinely blocked path (we keep sending, nothing
+// comes back) is still caught.
+func (b *fallbackBind) noteUDPSend(buf []byte) {
+	// A keepalive is a transport-data message (type 4, so buf[0]==4 in the
+	// little-endian type word) with an empty payload: 16-byte transport header +
+	// 16-byte Poly1305 tag = 32 bytes exactly. The smallest real data packet is
+	// 48 bytes and handshakes are 148/92/64, so length alone disambiguates.
+	const messageTransport = 4
+	const keepaliveSize = 32
+	if len(buf) == keepaliveSize && buf[0] == messageTransport {
+		return
+	}
+	atomic.StoreInt64(&b.lastUDPSendNano, time.Now().UnixNano())
+}
+
 // Send routes the packet over the carrier selected by the current mode.
 func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
 	switch atomic.LoadInt32(&b.mode) {
@@ -276,9 +312,11 @@ func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
 		// replies refresh lastUDPRecvNano and monitor climbs back to the UDP
 		// carrier — WITHOUT ever blackholing live traffic into a still-blocked
 		// UDP path (which stalls the tunneled TCP for seconds every re-probe).
+		b.noteUDPSend(buf)
 		_ = b.inner.Send(buf, ep)
 		return b.sendTCP(buf)
 	default: // carrierUDP
+		b.noteUDPSend(buf)
 		return b.inner.Send(buf, ep)
 	}
 }
@@ -519,21 +557,52 @@ func (b *fallbackBind) monitor() {
 	closeCh := b.closeCh
 	b.mu.Unlock()
 
-	ticker := time.NewTicker(time.Second)
+	const tickEvery = time.Second
+	// A gap between ticks far larger than tickEvery means this goroutine was not
+	// running — system sleep/suspend (or a severe scheduling stall). The
+	// WireGuardKitGo runtime's boottime patch makes the clock advance across
+	// sleep so WG's own protocol timers expire correctly, but it also means the
+	// silence we "observe" on the first post-wake tick is time we never actually
+	// watched the path, not evidence UDP is dead. Re-baseline the liveness clock
+	// on such a tick instead of switching, giving UDP a fresh udpSilenceTimeout
+	// to prove itself after wake.
+	const wakeResyncGap = 3 * time.Second
+
+	ticker := time.NewTicker(tickEvery)
 	defer ticker.Stop()
 
 	var tcpSince, probeSince time.Time
+	prevTick := time.Now()
 	for {
 		select {
 		case <-closeCh:
 			return
 		case now := <-ticker.C:
+			if now.Sub(prevTick) > wakeResyncGap {
+				// Suspended since the last tick: the accumulated silence is not
+				// ours to trust. Reset the UDP baseline (send strictly before
+				// recv, mirroring Open) and skip this tick's verdict so a real
+				// post-wake block is still caught one udpSilenceTimeout later.
+				atomic.StoreInt64(&b.lastUDPSendNano, 0)
+				atomic.StoreInt64(&b.lastUDPRecvNano, now.UnixNano())
+				prevTick = now
+				continue
+			}
+			prevTick = now
+
 			mode := atomic.LoadInt32(&b.mode)
 
 			lastUDP := time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano))
 			switch mode {
 			case carrierUDP:
-				if now.Sub(lastUDP) > udpSilenceTimeout {
+				lastSend := time.Unix(0, atomic.LoadInt64(&b.lastUDPSendNano))
+				// Only a path we are actively using can be declared dead: require
+				// an outbound UDP packet since the last inbound one (lastSend >
+				// lastUDP). This mirrors the C++ watchdog's txAdvanced gate — an
+				// idle tunnel sends nothing, so it never trips this even past
+				// udpSilenceTimeout, while a real block (we keep sending handshake
+				// initiations, nothing comes back) does.
+				if lastSend.After(lastUDP) && now.Sub(lastUDP) > udpSilenceTimeout {
 					atomic.StoreInt32(&b.mode, carrierTCP)
 					tcpSince = now
 					clog("CARRIER switch UDP->TCP (udp silent %v)", now.Sub(lastUDP).Truncate(time.Millisecond))
