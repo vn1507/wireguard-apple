@@ -55,13 +55,12 @@ func cstring(s string) *C.char {
 
 func (l CLogger) Printf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	// The device has no C-facing handshake event, so we tap its own log stream
-	// (every Verbosef line, level 0, funnels through here) for the two moments
-	// the UDP-only reconnection reaction needs. Done before the loggerFunc guard
-	// so it fires even when the host set no logger.
-	if l == 0 {
-		classifyHandshake(msg)
-	}
+	// The device has no C-facing handshake event, so we tap its own log stream for
+	// the moments the UDP-only reconnection reaction needs. Both levels are read:
+	// the handshake timers log at Verbosef (0) while the send failures log at
+	// Errorf (1). Done before the loggerFunc guard so it fires even when the host
+	// set no logger.
+	classifyHandshake(msg)
 	if uintptr(loggerFunc) == 0 {
 		return
 	}
@@ -76,14 +75,57 @@ func (l CLogger) Printf(format string, args ...interface{}) {
 //     handshake will not complete — the session is dead → down. It respects the
 //     tx gate for free: with no outbound traffic WG never initiates, so it never
 //     gives up on an idle tunnel.
+//   - "Failed to send" (send.go, Errorf) is the datagram never reaching the wire at
+//     all — the interface went away (WiFi off reads as "sendto: can't assign
+//     requested address"). Reported down directly rather than waiting for "giving
+//     up", which can take RekeyAttemptTime and, since a fresh initiation resets the
+//     attempt counter, may never arrive at all. It cannot fire on an idle tunnel
+//     either: with nothing to send there is no send to fail.
 //
 // TestHandshakeLogStringsPresent guards these against a device bump.
+// Send failures arrive as fast as the peer tries to transmit — dozens a second once
+// the interface is gone — and every down report spends one unit of the host's retry
+// budget (WGClientImpl::m_reconnectCountDown). Unpaced, that budget is gone in a
+// couple of seconds and a brief WiFi drop tears the session down. Pace them to the
+// same quantum every other reporter uses (RekeyTimeout; carrierRetryInterval in
+// conn_fallback.go, RetryInterval in wgtimers.h), so one report means one retry
+// attempt rather than one dropped packet. A returning handshake clears the stamp so
+// the next outage is reported without waiting out this interval.
+const sendFailureReportInterval = 5 * time.Second
+
+var (
+	sendFailureMu     sync.Mutex
+	lastSendFailureAt time.Time
+)
+
+func sendFailureReportDue() bool {
+	sendFailureMu.Lock()
+	defer sendFailureMu.Unlock()
+	now := time.Now()
+	if !lastSendFailureAt.IsZero() && now.Sub(lastSendFailureAt) < sendFailureReportInterval {
+		return false
+	}
+	lastSendFailureAt = now
+	return true
+}
+
+func resetSendFailurePacing() {
+	sendFailureMu.Lock()
+	lastSendFailureAt = time.Time{}
+	sendFailureMu.Unlock()
+}
+
 func classifyHandshake(msg string) {
 	switch {
 	case strings.Contains(msg, "Received handshake response"):
+		resetSendFailurePacing()
 		notifyHandshakeState(true)
 	case strings.Contains(msg, "giving up"):
 		notifyHandshakeState(false)
+	case strings.Contains(msg, "Failed to send"):
+		if sendFailureReportDue() {
+			notifyHandshakeState(false)
+		}
 	}
 }
 
