@@ -256,9 +256,9 @@ func wgTurnOn(settings *C.char, tunFd int32) int32 {
 	// Carry the optional wss relay URL out-of-band in the settings string and
 	// strip it before IpcSet (wireguard-go rejects unknown UAPI keys). An empty
 	// URL yields the stock UDP-only bind.
-	relayURL, cleaned := SplitRelayEndpoint(C.GoString(settings))
+	relayURL, relayToken, cleaned := SplitRelayEndpoint(C.GoString(settings))
 	carrierLogf = logger.Verbosef // route carrier lifecycle diagnostics to the WG log
-	bind := NewFallbackBind(relayURL)
+	bind := NewFallbackBind(relayURL, relayToken)
 	dev := device.NewDevice(tun, bind, logger)
 
 	err = dev.IpcSet(cleaned)
