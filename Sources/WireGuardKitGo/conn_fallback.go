@@ -588,6 +588,18 @@ func (b *fallbackBind) monitor() {
 					atomic.StoreInt32(&b.mode, carrierTCP)
 					tcpSince = now
 					clog("CARRIER switch UDP->TCP (udp silent %v)", now.Sub(lastUDP).Truncate(time.Millisecond))
+					// The host reads the live mode (wgGetCarrierMode) to report which
+					// port the tunnel is on, and it only distinguishes UDP (0) from the
+					// relay (carrierTCP/carrierProbe, both > 0). So notify exactly on
+					// the transitions that cross that boundary - this one and the
+					// recovery below - and stay quiet for the TCP<->Probe churn, which
+					// changes nothing the host can see. The carrier is up either way:
+					// "up" here means "the transport changed, re-read it", and the host
+					// treats a repeated up on a live connection as exactly that.
+					// reportCarrier() also fires on the very first wss dial; a duplicate
+					// is harmless, and this is the only notification a later switch
+					// gets, since a cached conn makes no dial attempt at all.
+					notifyCarrierState(true)
 				}
 			case carrierTCP:
 				// Periodically re-probe UDP, but non-destructively: enter the
@@ -603,6 +615,10 @@ func (b *fallbackBind) monitor() {
 					// A UDP reply landed during the probe → UDP is back.
 					atomic.StoreInt32(&b.mode, carrierUDP)
 					clog("CARRIER switch TCP->UDP (udp recovered)")
+					// Back across the UDP/relay boundary - see the UDP->TCP switch above.
+					// Nothing else reports this direction: the recovery is a plain mode
+					// store, with no dial and so no reportCarrier().
+					notifyCarrierState(true)
 				case now.Sub(probeSince) > udpReprobeWindow:
 					// UDP still dead; fall back to plain TCP until the next probe.
 					atomic.StoreInt32(&b.mode, carrierTCP)

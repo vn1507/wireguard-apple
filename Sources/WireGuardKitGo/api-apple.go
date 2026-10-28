@@ -71,6 +71,18 @@ func (l CLogger) Printf(format string, args ...interface{}) {
 // push for the host. The strings are stable for the pinned device version:
 //   - "Received handshake response" (receive.go) is exactly timersHandshakeComplete
 //     for the initiator — the path is alive again → up.
+//   - "Received handshake initiation" and "Receiving keepalive packet" (receive.go)
+//     are the same proof from the other direction. Both are logged only for a packet
+//     that passed authentication, so the peer is there and the path carries. They are
+//     needed because the response line fires only when WE initiated, and a session the
+//     GATEWAY revives after a sleep never produces one: measured on a 95 s nap, the
+//     server re-initiated 0.2 s after the wake and the host still sat on Connecting
+//     for 4.6 s, until the 5 s liveness poll happened to look. The keepalive line is
+//     logged after timersHandshakeComplete(), so the handshake stamp the host checks
+//     is already fresh by then; the initiation line arrives one round trip earlier,
+//     before the stamp moves, and the host's own staleness gate decides what to do
+//     with it. An up report costs nothing on a healthy tunnel — the host edge-gates
+//     it on m_reportedUp — so the keepalives of an ordinary session are no-ops.
 //   - "giving up" (timers.go, after RekeyAttemptTime) is WG's own verdict that the
 //     handshake will not complete — the session is dead → down. It respects the
 //     tx gate for free: with no outbound traffic WG never initiates, so it never
@@ -117,7 +129,9 @@ func resetSendFailurePacing() {
 
 func classifyHandshake(msg string) {
 	switch {
-	case strings.Contains(msg, "Received handshake response"):
+	case strings.Contains(msg, "Received handshake response"),
+		strings.Contains(msg, "Received handshake initiation"),
+		strings.Contains(msg, "Receiving keepalive packet"):
 		resetSendFailurePacing()
 		notifyHandshakeState(true)
 	case strings.Contains(msg, "giving up"):
