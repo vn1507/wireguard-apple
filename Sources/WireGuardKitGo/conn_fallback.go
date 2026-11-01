@@ -93,6 +93,13 @@ const (
 	udpConnectSilenceTimeout = 8 * time.Second
 )
 
+// carrierDialTimeout bounds one wss dial. It matters most to the monitor, which
+// dials the relay to find out whether it could carry anything before giving up on
+// UDP: an unbounded dial into a blackhole blocks on an unanswered SYN for as long
+// as the OS keeps retransmitting it - about 75 s - and the liveness watch blocks
+// with it.
+const carrierDialTimeout = 10 * time.Second
+
 // carrierRetryInterval is how long a failed carrier waits before the next redial
 // attempt — the analog of the ovpn3 core's reconnect interval, which is what
 // paces the RECONNECTING events the host counts (OVPNClientImpl::stateEvent).
@@ -267,11 +274,20 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		// does it without diverting traffic onto a path that may not carry it.
 		atomic.StoreInt32(&b.mode, carrierUDP)
 		atomic.StoreInt32(&b.everRecvUDP, 0)
+		// Seed send strictly before recv so a fresh session never trips the monitor
+		// until we have actually sent something over UDP this session.
+		atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
+		atomic.StoreInt64(&b.lastUDPSendNano, 0)
 	}
-	atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
-	// Seed send strictly before recv so a fresh session never trips the monitor
-	// until we have actually sent something over UDP this session.
-	atomic.StoreInt64(&b.lastUDPSendNano, 0)
+	// The liveness clocks deliberately survive a re-open, for the same reason the
+	// mode does. A fresh recv stamp is indistinguishable from an arrived packet, and
+	// both branches of the monitor read it as one: carrierProbe takes
+	// lastUDPRecvNano > probeSince as "UDP recovered" and switches the whole tunnel
+	// back onto a path nothing has come from, while carrierUDP restarts the silence
+	// countdown from zero. Open() runs on every BindUpdate - the C++ watchdog bumps
+	// the socket at PathSilenceTimeout, and again on every wake - so stamping here
+	// published UDP one second after a wake with UDP firewalled off, and postponed
+	// the real verdict by a full udpSilenceTimeout per kick.
 	// Start "up" so the first failed dial registers as a genuine down edge.
 	atomic.StoreInt32(&b.carrierUp, 1)
 
@@ -486,6 +502,7 @@ func (b *fallbackBind) dialWS() (*websocket.Conn, bool, error) {
 	if err != nil {
 		return fail(err)
 	}
+	cfg.Dialer = &net.Dialer{Timeout: carrierDialTimeout}
 	// Where to forward, and the manager's attestation of it. The relay takes the
 	// destination from the header and only accepts it when the token's "tgt" claim
 	// says the same, so the two always travel together.
@@ -601,9 +618,40 @@ func (b *fallbackBind) monitor() {
 					silence = udpConnectSilenceTimeout
 				}
 				if lastSend.After(lastUDP) && now.Sub(lastUDP) > silence {
+					// Silence says UDP is not carrying us. It does not say the relay
+					// would, so prove that before giving up the path we have. With no
+					// network at all - WiFi switched off - every UDP send fails with
+					// EADDRNOTAVAIL and the silence accumulates exactly as it does under
+					// a filtered path; switching on it published TCP, dialled into the
+					// void for as long as the outage lasted, and then brought the session
+					// back up on the relay instead of the direct path that had just
+					// become available again. A dial is also the only honest test, since
+					// it covers a relay that is down, unreachable or refusing the token
+					// and not merely a missing route.
+					ws, attempted, derr := b.dialWS()
+					// Dialling is time we knowingly spent not watching the path, not a
+					// suspend: leaving it to look like one would re-baseline the UDP
+					// clock below and erase the very verdict we are acting on.
+					prevTick = time.Now()
+					if derr != nil || ws == nil {
+						if attempted {
+							clog("CARRIER keeping UDP (udp silent %v, relay unreachable: %v)",
+								now.Sub(lastUDP).Truncate(time.Millisecond), derr)
+						}
+						continue
+					}
+					// The dial can take seconds, and UDP may have answered during them -
+					// then there is nothing left to fall back from.
+					if time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano)).After(lastUDP) {
+						clog("CARRIER keeping UDP (recovered while dialling the relay)")
+						continue
+					}
 					atomic.StoreInt32(&b.mode, carrierTCP)
 					tcpSince = now
 					clog("CARRIER switch UDP->TCP (udp silent %v)", now.Sub(lastUDP).Truncate(time.Millisecond))
+					// The dial above was a real attempt and it succeeded: record it so
+					// carrierUp stays honest and a later drop still reports one down edge.
+					b.reportCarrier(true)
 					// The host reads the live mode (wgGetCarrierMode) to report which
 					// port the tunnel is on, and it only distinguishes UDP (0) from the
 					// relay (carrierTCP/carrierProbe, both > 0). So notify exactly on
