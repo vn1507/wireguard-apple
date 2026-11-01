@@ -180,6 +180,12 @@ type fallbackBind struct {
 	// tells the initial probe apart from a mid-session drop.
 	everRecvUDP int32
 
+	// everOpened is set by the first Open and never cleared, which is what tells a
+	// brand-new session from a re-open of this one. wireguard-go calls Open again on
+	// every BindUpdate - a socket bump, and a resume from sleep - and what it must NOT
+	// do then is forget what this session already learned about the path. Guarded by mu.
+	everOpened bool
+
 	// carrierUp is 1 while the wss carrier last dialed successfully, 0 once a dial
 	// failed (atomic). The up edge gates reporting so recovery is reported once,
 	// not per surviving packet.
@@ -247,12 +253,22 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	// attempted immediately rather than replaying a stale failure.
 	b.lastDialFail = time.Time{}
 	b.lastDialErr = nil
+	firstOpen := !b.everOpened
+	b.everOpened = true
 	b.mu.Unlock()
-	atomic.StoreInt32(&b.mode, carrierUDP)
+	if firstOpen {
+		// Only a new session starts out on UDP knowing nothing. A re-open keeps both:
+		// wireguard-go calls Open again on a socket bump and on resume from sleep, and
+		// resetting here threw away the one thing this session had established - that UDP
+		// is blocked on this network. The carrier went back to UDP, the host published it,
+		// and the monitor spent the short initial window rediscovering the block before
+		// switching back to TCP: a visible transport flip and several dead seconds after
+		// every wake. Climbing back to UDP is the re-probe's job (udpReprobeEvery), which
+		// does it without diverting traffic onto a path that may not carry it.
+		atomic.StoreInt32(&b.mode, carrierUDP)
+		atomic.StoreInt32(&b.everRecvUDP, 0)
+	}
 	atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
-	// Nothing has come back over UDP in THIS session yet, so the monitor judges the
-	// path on the short initial window until something does.
-	atomic.StoreInt32(&b.everRecvUDP, 0)
 	// Seed send strictly before recv so a fresh session never trips the monitor
 	// until we have actually sent something over UDP this session.
 	atomic.StoreInt64(&b.lastUDPSendNano, 0)
