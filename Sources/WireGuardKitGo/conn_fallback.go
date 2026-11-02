@@ -596,6 +596,19 @@ func (b *fallbackBind) monitor() {
 				// post-wake block is still caught one udpSilenceTimeout later.
 				atomic.StoreInt64(&b.lastUDPSendNano, 0)
 				atomic.StoreInt64(&b.lastUDPRecvNano, now.UnixNano())
+				// The windows this goroutine measures have to move with that
+				// baseline, because the recv stamp above is a fiction - nothing
+				// arrived, we simply refuse to count time we never watched. The
+				// carrierProbe branch cannot tell that fiction from a real packet:
+				// it asks whether a recv landed after probeSince, and a probe
+				// window opened BEFORE the sleep is satisfied by a stamp written
+				// after it. That is how a wake with UDP firewalled off announced
+				// "udp recovered" one tick later and moved the whole tunnel back
+				// onto a path where every send then failed with EADDRNOTAVAIL.
+				// Moving both windows to now makes the post-wake probe prove UDP
+				// on its own evidence, within its own udpReprobeWindow.
+				tcpSince = now
+				probeSince = now
 				prevTick = now
 				continue
 			}
