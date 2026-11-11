@@ -20,9 +20,14 @@ package main
 // {
 // 	((void(*)(void *, int32_t))func)(ctx, up);
 // }
+// static void callCarrierTarget(void *func, void *ctx, const char *addr)
+// {
+// 	((void(*)(void *, const char *))func)(ctx, addr);
+// }
 import "C"
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math"
 	"os"
@@ -67,42 +72,17 @@ func (l CLogger) Printf(format string, args ...interface{}) {
 	C.callLogger(loggerFunc, loggerCtx, C.int(l), cstring(msg))
 }
 
-// classifyHandshake turns wireguard-go's own timer log lines into a liveness
-// push for the host. The strings are stable for the pinned device version:
-//   - "Received handshake response" (receive.go) is exactly timersHandshakeComplete
-//     for the initiator — the path is alive again → up.
-//   - "Received handshake initiation" and "Receiving keepalive packet" (receive.go)
-//     are the same proof from the other direction. Both are logged only for a packet
-//     that passed authentication, so the peer is there and the path carries. They are
-//     needed because the response line fires only when WE initiated, and a session the
-//     GATEWAY revives after a sleep never produces one: measured on a 95 s nap, the
-//     server re-initiated 0.2 s after the wake and the host still sat on Connecting
-//     for 4.6 s, until the 5 s liveness poll happened to look. The keepalive line is
-//     logged after timersHandshakeComplete(), so the handshake stamp the host checks
-//     is already fresh by then; the initiation line arrives one round trip earlier,
-//     before the stamp moves, and the host's own staleness gate decides what to do
-//     with it. An up report costs nothing on a healthy tunnel — the host edge-gates
-//     it on m_reportedUp — so the keepalives of an ordinary session are no-ops.
-//   - "giving up" (timers.go, after RekeyAttemptTime) is WG's own verdict that the
-//     handshake will not complete — the session is dead → down. It respects the
-//     tx gate for free: with no outbound traffic WG never initiates, so it never
-//     gives up on an idle tunnel.
-//   - "Failed to send" (send.go, Errorf) is the datagram never reaching the wire at
-//     all — the interface went away (WiFi off reads as "sendto: can't assign
-//     requested address"). Reported down directly rather than waiting for "giving
-//     up", which can take RekeyAttemptTime and, since a fresh initiation resets the
-//     attempt counter, may never arrive at all. It cannot fire on an idle tunnel
-//     either: with nothing to send there is no send to fail.
+// How often a failed send may be reported to the host. The report itself is made by the
+// bind, which holds the error (conn_fallback.go: Send), but the pacing lives here next to
+// the other half of the pair: resetSendFailurePacing() is called the moment a round trip
+// lands, so the next outage is reported without waiting this out.
 //
-// TestHandshakeLogStringsPresent guards these against a device bump.
-// Send failures arrive as fast as the peer tries to transmit — dozens a second once
-// the interface is gone — and every down report spends one unit of the host's retry
-// budget (WGClientImpl::m_reconnectCountDown). Unpaced, that budget is gone in a
-// couple of seconds and a brief WiFi drop tears the session down. Pace them to the
-// same quantum every other reporter uses (RekeyTimeout; carrierRetryInterval in
-// conn_fallback.go, RetryInterval in wgtimers.h), so one report means one retry
-// attempt rather than one dropped packet. A returning handshake clears the stamp so
-// the next outage is reported without waiting out this interval.
+// Paced because send failures arrive as fast as the peer tries to transmit - dozens a
+// second once the interface is gone - and every down report spends one unit of the host's
+// retry budget (WGClientImpl::m_reconnectCountDown). Unpaced, that budget is gone in a
+// couple of seconds and a brief WiFi drop tears the session down. The quantum is the one
+// every other reporter uses (RekeyTimeout; carrierRetryInterval in conn_fallback.go,
+// RetryInterval in wgtimers.h), so one report means one retry attempt.
 const sendFailureReportInterval = 5 * time.Second
 
 var (
@@ -127,19 +107,23 @@ func resetSendFailurePacing() {
 	sendFailureMu.Unlock()
 }
 
+// classifyHandshake reads the ONE thing the host still needs from the device's own log:
+// WG's verdict that the handshake will not complete ("giving up", timers.go, after
+// RekeyAttemptTime). That one is a decision of the device's timers, not a packet, so
+// there is nothing below this layer to report it.
+//
+// Everything else the host used to learn by matching log lines - a handshake response, an
+// initiation, a keepalive, a send that never left the machine - is now reported by the
+// bind, from the packet and the error themselves (conn_fallback.go: noteLiveness, Send).
+// Matching strings for those was a guess at a wording that a device bump could change
+// silently, and for the response it was also a race: the device writes that line BEFORE
+// timersHandshakeComplete() moves the stamp the host then checks.
+//
+// It respects the tx gate for free: with no outbound traffic WG never initiates, so it
+// never gives up on an idle tunnel.
 func classifyHandshake(msg string) {
-	switch {
-	case strings.Contains(msg, "Received handshake response"),
-		strings.Contains(msg, "Received handshake initiation"),
-		strings.Contains(msg, "Receiving keepalive packet"):
-		resetSendFailurePacing()
-		notifyHandshakeState(true)
-	case strings.Contains(msg, "giving up"):
-		notifyHandshakeState(false)
-	case strings.Contains(msg, "Failed to send"):
-		if sendFailureReportDue() {
-			notifyHandshakeState(false)
-		}
+	if strings.Contains(msg, "giving up") {
+		notifyHandshakeState(handshakeDown)
 	}
 }
 
@@ -147,12 +131,23 @@ func classifyHandshake(msg string) {
 // liveness push for the UDP-only case (no carrier). Mirrors carrierStateFn;
 // guarded by handshakeStateMu because the bridge clears it on tunnel teardown
 // while device timer goroutines may still be logging.
-var (
-	handshakeStateMu sync.Mutex
-	handshakeStateFn func(up bool)
+//
+// The three values the push carries. They cross into C as the int32 of
+// wgSetHandshakeStateFn, and both ends tolerate the other being older: a host that only
+// knows up/down reads handshakeHint as a plain "up", and a bridge that only knows up/down
+// sends handshakeProven, which is how an "up" used to be treated.
+const (
+	handshakeDown   int32 = 0 // the session is dead (WG gave up, or a send never left)
+	handshakeProven int32 = 1 // a full round trip landed: report it
+	handshakeHint   int32 = 2 // something arrived; whether it proves anything is the host's call
 )
 
-func setHandshakeStateFn(fn func(up bool)) {
+var (
+	handshakeStateMu sync.Mutex
+	handshakeStateFn func(state int32)
+)
+
+func setHandshakeStateFn(fn func(state int32)) {
 	handshakeStateMu.Lock()
 	handshakeStateFn = fn
 	handshakeStateMu.Unlock()
@@ -161,12 +156,12 @@ func setHandshakeStateFn(fn func(up bool)) {
 // notifyHandshakeState calls the host callback with handshakeStateMu released.
 // The callback only queues onto the host's runloop (never blocks), so firing it
 // from inside a device timer log call cannot deadlock against a device lock.
-func notifyHandshakeState(up bool) {
+func notifyHandshakeState(state int32) {
 	handshakeStateMu.Lock()
 	fn := handshakeStateFn
 	handshakeStateMu.Unlock()
 	if fn != nil {
-		fn(up)
+		fn(state)
 	}
 }
 
@@ -233,13 +228,51 @@ func wgSetHandshakeStateFn(context, fn uintptr) {
 	}
 	ctxPtr := unsafe.Pointer(context)
 	fnPtr := unsafe.Pointer(fn)
-	setHandshakeStateFn(func(up bool) {
-		var v C.int32_t
-		if up {
-			v = 1
-		}
-		C.callHandshakeState(fnPtr, ctxPtr, v)
+	setHandshakeStateFn(func(state int32) {
+		C.callHandshakeState(fnPtr, ctxPtr, C.int32_t(state))
 	})
+}
+
+// wgSetCarrierTargetFn installs the host callback the carrier calls with the address it
+// is about to dial, BEFORE it dials it, so the host can keep the relay's own packets out
+// of the tunnel (in a full tunnel they have to be pinned to the physical gateway, and the
+// pin can only name an address somebody has chosen). The callback runs on the dialling
+// goroutine and the dial waits for it. Pass a null fn to unregister - the host MUST do so
+// before tearing the tunnel down.
+//
+//export wgSetCarrierTargetFn
+func wgSetCarrierTargetFn(context, fn uintptr) {
+	if fn == 0 {
+		setCarrierTargetFn(nil)
+		return
+	}
+	ctxPtr := unsafe.Pointer(context)
+	fnPtr := unsafe.Pointer(fn)
+	setCarrierTargetFn(func(addr string) {
+		C.callCarrierTarget(fnPtr, ctxPtr, cstring(addr))
+	})
+}
+
+// peerKeysFromUAPI pulls the peers' public keys out of the UAPI configuration the host
+// hands wgTurnOn, so the bridge can address a peer directly (device.LookupPeer) instead
+// of going through the device's own timers. One key per "public_key=" line, hex.
+func peerKeysFromUAPI(settings string) []device.NoisePublicKey {
+	const prefix = "public_key="
+	var keys []device.NoisePublicKey
+	for _, line := range strings.Split(settings, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		raw, err := hex.DecodeString(strings.TrimSpace(line[len(prefix):]))
+		if err != nil || len(raw) != device.NoisePublicKeySize {
+			continue
+		}
+		var key device.NoisePublicKey
+		copy(key[:], raw)
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 //export wgTurnOn
@@ -280,6 +313,27 @@ func wgTurnOn(settings *C.char, tunFd int32) int32 {
 		logger.Errorf("Unable to set IPC settings: %v", err)
 		unix.Close(dupTunFd)
 		return -1
+	}
+
+	// What a UDP probe rides: a handshake initiation, on demand, from the peer itself -
+	// the one packet the server answers at once (see fallbackBind.probeHandshake). Set
+	// after IpcSet, which is what creates the peers LookupPeer resolves, and before
+	// dev.Up(), which opens the bind and starts the monitor that reads it.
+	//
+	// isRetry is true on purpose: a non-retry initiation resets the device's
+	// handshake-attempt counter, and with it WG's own "giving up" verdict - the host's
+	// only down report on the UDP-only path.
+	if fb, ok := bind.(*fallbackBind); ok {
+		keys := peerKeysFromUAPI(cleaned)
+		fb.SetProbeHandshake(func() {
+			for _, key := range keys {
+				if peer := dev.LookupPeer(key); peer != nil {
+					if perr := peer.SendHandshakeInitiation(true); perr != nil {
+						logger.Verbosef("probe: handshake initiation failed: %v", perr)
+					}
+				}
+			}
+		})
 	}
 
 	dev.Up()
@@ -347,6 +401,15 @@ func wgGetCarrierMode(tunnelHandle int32) int32 {
 		return -1 // no such tunnel / UDP-only build
 	}
 	return handle.bind.Mode() // 0 UDP, 1 TCP, 2 probe (on TCP data-plane)
+}
+
+//export wgArmUDPProbe
+func wgArmUDPProbe(tunnelHandle int32) {
+	handle, ok := tunnelHandles[tunnelHandle]
+	if !ok || handle.bind == nil {
+		return
+	}
+	handle.bind.ArmProbe()
 }
 
 //export wgBumpSockets

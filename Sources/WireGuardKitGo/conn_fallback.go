@@ -24,6 +24,8 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -79,9 +81,49 @@ const (
 // the preferred carrier — TCP is a fallback only (TCP-over-TCP degrades under
 // loss), so we keep trying to climb back to UDP.
 const (
-	udpSilenceTimeout = 25 * time.Second
+	// How long inbound silence has to last, while we are sending, before the path we are
+	// on is declared not to be carrying us. It is WireGuard's own number: KeepaliveTimeout
+	// after receiving our traffic the peer owes us a passive keepalive, and one
+	// RekeyTimeout later the device gives up on the session and re-initiates ("Retrying
+	// handshake because we stopped hearing back after 15 seconds", device/timers.go). So
+	// this is the moment the protocol itself calls the path dead, and switching exactly
+	// then puts the initiation WireGuard is about to send on the new carrier.
+	//
+	// It MUST stay below the host's PathSilenceTimeout (wgtimers.h), the moment the host
+	// REPORTS a loss and arms the service's one-minute teardown: the layer that can fix
+	// the problem has to act before the layer that can only complain about it. The other
+	// way round on 2026-11-13, the host reported Reconnecting at 15 s while the carrier
+	// only began looking for a way out at 25 s.
+	udpSilenceTimeout = device.KeepaliveTimeout + device.RekeyTimeout
 	udpReprobeEvery   = 30 * time.Second
 	udpReprobeWindow  = 5 * time.Second
+	// The same rule for the relay, which until now had no liveness of its own at all: a
+	// wss carrier whose far end goes away without closing the socket - a NAT timeout, a
+	// front end pulled out of service, a black-holed path - never errors, because the
+	// reader blocks and the writes land in the kernel buffer. Nothing redialled it. That
+	// is the hole the 22:09:57-22:10:15 silence of 2026-11-13 fell through.
+	relaySilenceTimeout = udpSilenceTimeout
+
+	// One write to the relay socket may not hold the device's sender for longer than
+	// this. Without a deadline a stalled connection (a full window, a path that stopped
+	// acknowledging) blocks the WireGuard send path for as long as the OS retransmits.
+	relayWriteTimeout = device.RekeyTimeout
+
+	// How long an armed probe waits for its initiation to ride before giving up. The
+	// probe forces one itself, and the device rate-limits initiations to one per
+	// RekeyTimeout (device/send.go), so a slot still empty after that plus one window is
+	// a probe nothing is going to ride - and while the mode sits at carrierProbe the
+	// periodic re-probe does not run at all.
+	probeArmWindow = device.RekeyTimeout + udpReprobeWindow
+
+	// How long the FIRST probe of a relay spell waits. The block that drove us here is
+	// usually somebody's network, not ours - a captive hotspot, a conference wifi, a
+	// firewall between two offices - and the thing that ends it is just as abrupt: the
+	// laptop moves, the rule is lifted, the user reconnects. There is no reason the
+	// first look should cost a full udpReprobeEvery, and that one interval was the
+	// largest single part of a 51 s recovery measured on 2026-11-12. Later probes keep
+	// the longer spacing, because by then the block has proven to be a lasting one.
+	udpReprobeFirst = 10 * time.Second
 
 	// Until the first inbound UDP packet of this session, the same verdict is made
 	// on a much shorter window: this is the initial "is UDP usable at all" probe,
@@ -148,6 +190,38 @@ func setCarrierStateFn(fn func(up bool)) {
 	carrierStateMu.Unlock()
 }
 
+// carrierTargetFn, when set by the bridge (wgSetCarrierTargetFn), is told which address
+// the carrier is about to dial, before it dials it. The host needs that to keep the
+// relay's own packets out of the tunnel: in a full tunnel they have to be pinned to the
+// physical gateway, and a pin can only name an address somebody has chosen. The
+// exclusions installed at bring-up name the relay as the profile spelled it then, which
+// a redial onto another front end, a re-fetched profile and a relay host with several
+// addresses all leave behind - and a dial that goes into the tunnel it exists to replace
+// cannot come back. Same answer OpenVPN's updateGateway hands the service: what the
+// transport picked, reported by the layer that picked it.
+var carrierTargetFn func(addr string)
+
+func setCarrierTargetFn(fn func(addr string)) {
+	carrierStateMu.Lock()
+	carrierTargetFn = fn
+	carrierStateMu.Unlock()
+}
+
+// notifyCarrierTarget calls that callback with carrierStateMu released - it crosses into
+// C++ and must not run under a bind lock. It is called on the dialling path, so the host
+// does its route surgery while the dial waits.
+func notifyCarrierTarget(addr string) {
+	if addr == "" {
+		return
+	}
+	carrierStateMu.Lock()
+	fn := carrierTargetFn
+	carrierStateMu.Unlock()
+	if fn != nil {
+		fn(addr)
+	}
+}
+
 // notifyCarrierState calls the host callback with carrierStateMu released: it
 // crosses into C++ and must not run while a bind lock is held.
 func notifyCarrierState(up bool) {
@@ -181,6 +255,68 @@ type fallbackBind struct {
 	// txAdvanced gate: an idle tunnel with no traffic and no PersistentKeepalive
 	// legitimately goes quiet and must not flap onto the TCP carrier.
 	lastUDPSendNano int64
+
+	// lastUDPProvenNano is lastUDPRecvNano without the inbound packets that say
+	// nothing about OUR direction (atomic). Today that is the handshake initiation:
+	// a peer initiates only while it has NOT heard from us, and repeats every
+	// RekeyTimeout for as long as that lasts, so counting one as liveness keeps the
+	// silence rule below fresh exactly when the path is dead outbound. Measured on
+	// 2026-11-10: with our egress to :51820 firewalled off and the server re-initiating
+	// every 5 s, the switch to the relay took 4 min 7 s instead of the intended 26 s.
+	//
+	// Separate from lastUDPRecvNano rather than replacing it, because the two answer
+	// different questions and both answers are right: "is the UDP path carrying this
+	// session" (here) and "has the peer come back onto UDP at all" (there, which is
+	// what the re-probe reads - see the carrierTCP branch of monitor).
+	lastUDPProvenNano int64
+
+	// lastProbeSendNano is when the current probe last put a packet on UDP, 0 if it has
+	// not managed to yet (atomic). The probe is only as good as the packet it rides, and
+	// it has no packets of its own: it duplicates whatever WireGuard happens to send. So
+	// this, not a wall-clock window, is what the probe is measured against - it is the
+	// moment a reply became possible at all.
+	//
+	// Distinct from lastUDPSendNano because that one deliberately skips keepalives (see
+	// noteUDPSend): nothing answers a keepalive, so it cannot arm the silence detector.
+	// For a probe a keepalive is enough, and on an idle tunnel it is all there is - the
+	// server authenticates it, adopts the source it arrived from (device/receive.go:
+	// SetEndpointFromPacket) and its own next packet comes back over UDP. That is the
+	// round trip the probe is waiting for, and it is why an idle tunnel can prove UDP
+	// at all.
+	lastProbeSendNano int64
+
+	// probeHandshake asks the device to send a handshake initiation to the peer. That is
+	// the packet - and the only packet - a probe is worth riding: the server answers an
+	// initiation at once, so the answer lands inside the probe's window, where a
+	// keepalive is answered by nothing at all and leaves the verdict to the peer's own
+	// next packet up to a keepalive interval away. nil when the host did not wire it up,
+	// and the probe then waits for an initiation the device sends on its own.
+	//
+	// It has to come from the device: the packet must be a REAL one, built with the keys.
+	// Plain field, no lock - set once, between device.NewDevice() and dev.Up(), so it is
+	// in place before Open() starts the monitor that reads it.
+	probeHandshake func()
+
+	// lastTCPRecvNano / lastTCPSendNano are the relay's own liveness clocks (atomic),
+	// the mirror of the two UDP ones above and read the same way: only a carrier we are
+	// actively sending real packets on may be declared dead, which is what keeps an idle
+	// tunnel from being flapped. The send stamp skips keepalives for the reason
+	// noteUDPSend gives. Until these existed the relay had no liveness at all.
+	lastTCPRecvNano int64
+	lastTCPSendNano int64
+
+	// probeArmedNano is when the current probe was armed (atomic), which is what bounds
+	// the wait for something to ride it: while the mode sits at carrierProbe the periodic
+	// re-probe does not run, so a probe nobody rides used to be able to stop the climb
+	// back to UDP for the rest of the session.
+	probeArmedNano int64
+
+	// lastPushNano / lastPushState pace the liveness push to the host (atomic): what was
+	// last said, and when. A change is always worth saying at once; a repetition waits
+	// out one RekeyTimeout, because the push crosses into C++ and real data would
+	// otherwise push on every packet.
+	lastPushNano  int64
+	lastPushState int32
 
 	// everRecvUDP is 1 once any inbound UDP packet has arrived this session
 	// (atomic). Until then the tunnel has never been up over UDP, which is what
@@ -235,6 +371,47 @@ func NewFallbackBind(relayURL, relayToken string) conn.Bind {
 	}
 }
 
+// SetProbeHandshake hands the bind the way to make the device initiate a handshake.
+// Called once after the device is built and before it is brought up - see probeHandshake.
+func (b *fallbackBind) SetProbeHandshake(initiate func()) {
+	b.probeHandshake = initiate
+}
+
+// ArmProbe arms a probe that only a handshake initiation may ride, if the bind is on
+// the relay at all. The host calls it (wgArmUDPProbe) at the moment its own watchdog
+// gives up on the relay and reports Reconnecting: a carrier that has stopped answering
+// has nothing left to lose, WireGuard is already sending a fresh initiation every
+// RekeyTimeout, and this costs one packet to put the next one on UDP instead - where,
+// if UDP is open, the answer comes back inside the probe's own window.
+//
+// A no-op anywhere else: on UDP there is nothing to probe, and if a probe is already
+// under way the CAS simply fails and leaves it alone.
+// ArmProbe starts a probe of the direct path, if the bind is on the relay at all: the
+// next handshake initiation goes out over UDP instead of the relay, and whether its
+// answer arrives there is the whole verdict. The host calls it (wgArmUDPProbe) when its
+// own watchdog gives up on the relay - a carrier that has stopped answering has nothing
+// left to lose, and the direct path is then the most worth re-testing.
+//
+// A no-op anywhere else: on UDP there is nothing to probe, and a probe already under way
+// is left alone (the CAS fails). Throttled, because the host reports a silent relay once
+// per RetryInterval and the device initiates on the same cadence - arming on every report
+// would hand every initiation to UDP and leave the relay, which may be the one path that
+// still works, nothing to recover with.
+func (b *fallbackBind) ArmProbe() {
+	if time.Since(time.Unix(0, atomic.LoadInt64(&b.probeArmedNano))) < udpReprobeFirst {
+		return
+	}
+	if !atomic.CompareAndSwapInt32(&b.mode, carrierTCP, carrierProbe) {
+		return
+	}
+	atomic.StoreInt64(&b.lastProbeSendNano, 0)
+	atomic.StoreInt64(&b.probeArmedNano, time.Now().UnixNano())
+	clog("CARRIER probing UDP with the next handshake (the relay has gone quiet)")
+	if initiate := b.probeHandshake; initiate != nil {
+		go initiate()
+	}
+}
+
 // Mode returns the carrier the bind is currently sending on (carrierUDP,
 // carrierTCP, or carrierProbe), read atomically. The host app queries it through
 // the bridge (wgGetCarrierMode) to report the live transport — e.g. the relay's
@@ -276,7 +453,9 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		atomic.StoreInt32(&b.everRecvUDP, 0)
 		// Seed send strictly before recv so a fresh session never trips the monitor
 		// until we have actually sent something over UDP this session.
-		atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
+		now := time.Now().UnixNano()
+		atomic.StoreInt64(&b.lastUDPRecvNano, now)
+		atomic.StoreInt64(&b.lastUDPProvenNano, now)
 		atomic.StoreInt64(&b.lastUDPSendNano, 0)
 	}
 	// The liveness clocks deliberately survive a re-open, for the same reason the
@@ -297,8 +476,7 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		fns = append(fns, func(buf []byte) (int, conn.Endpoint, error) {
 			n, ep, ferr := inner(buf)
 			if ferr == nil {
-				atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
-				atomic.StoreInt32(&b.everRecvUDP, 1)
+				b.noteUDPRecv(buf[:n])
 			}
 			return n, ep, ferr
 		})
@@ -328,6 +506,14 @@ func (b *fallbackBind) receiveTCP(buf []byte) (int, conn.Endpoint, error) {
 			return 0, nil, net.ErrClosed
 		}
 		n := copy(buf, frame)
+		// What the relay just delivered says two things, and both have a reader: the
+		// relay is carrying inbound traffic (its own liveness clock, read by the monitor)
+		// and, if the packet answers one of ours, the session is alive in our direction -
+		// which is the liveness report the host used to get by matching log lines.
+		if shape := wgShape(frame); shape != shapeUnknown {
+			atomic.StoreInt64(&b.lastTCPRecvNano, time.Now().UnixNano())
+			b.noteLiveness(shape)
+		}
 		ep, _ := b.canonEP.Load().(conn.Endpoint)
 		if ep == nil {
 			// No endpoint parsed yet; drop rather than hand WG a nil ep.
@@ -339,6 +525,62 @@ func (b *fallbackBind) receiveTCP(buf []byte) (int, conn.Endpoint, error) {
 	}
 }
 
+// WireGuard datagram shapes, as far as they can be told apart without the keys: the
+// type word and the length are the whole of it. Everything in this file that reasons
+// about a packet - what a probe may ride, what counts as liveness, what re-homes the
+// peer onto the carrier it arrived on - reasons about one of these.
+const (
+	shapeUnknown    int32 = iota // not a WireGuard datagram at all
+	shapeInitiation              // a handshake initiation: the peer has not heard from us
+	shapeKeepalive               // an empty transport packet: nothing ever answers one
+	shapeExchange                // a response, a cookie reply, or real data
+)
+
+// wgShape classifies one datagram by type and length. It is deliberately strict: a read
+// off the UDP socket is not necessarily a WireGuard packet at all - inner() reports any
+// datagram the kernel had, and the device drops a good share of them without a word -
+// and on 2026-11-10 one such silent arrival was taken for liveness and moved the whole
+// tunnel onto a path where not a single handshake of ours was being answered.
+func wgShape(pkt []byte) int32 {
+	const (
+		messageInitiation  = 1
+		messageResponse    = 2
+		messageCookieReply = 3
+		messageTransport   = 4
+
+		sizeInitiation   = 148
+		sizeResponse     = 92
+		sizeCookieReply  = 64
+		sizeMinTransport = 32
+	)
+
+	if len(pkt) < sizeMinTransport {
+		return shapeUnknown
+	}
+	switch pkt[0] {
+	case messageInitiation:
+		if len(pkt) == sizeInitiation {
+			return shapeInitiation
+		}
+	case messageResponse:
+		if len(pkt) == sizeResponse {
+			return shapeExchange
+		}
+	case messageCookieReply:
+		if len(pkt) == sizeCookieReply {
+			return shapeExchange
+		}
+	case messageTransport:
+		// A keepalive is exactly the minimum - a 16-byte transport header plus a
+		// 16-byte Poly1305 tag and no payload; the smallest real data packet is 48.
+		if len(pkt) == sizeMinTransport {
+			return shapeKeepalive
+		}
+		return shapeExchange
+	}
+	return shapeUnknown
+}
+
 // noteUDPSend records an outbound UDP packet for the liveness monitor, but only
 // for packets that warrant a reply. WireGuard keepalives are one-way (the peer
 // never answers them), so counting our own keepalive as "we are using the path"
@@ -348,16 +590,85 @@ func (b *fallbackBind) receiveTCP(buf []byte) (int, conn.Endpoint, error) {
 // still arm the detector, so a genuinely blocked path (we keep sending, nothing
 // comes back) is still caught.
 func (b *fallbackBind) noteUDPSend(buf []byte) {
-	// A keepalive is a transport-data message (type 4, so buf[0]==4 in the
-	// little-endian type word) with an empty payload: 16-byte transport header +
-	// 16-byte Poly1305 tag = 32 bytes exactly. The smallest real data packet is
-	// 48 bytes and handshakes are 148/92/64, so length alone disambiguates.
-	const messageTransport = 4
-	const keepaliveSize = 32
-	if len(buf) == keepaliveSize && buf[0] == messageTransport {
+	if wgShape(buf) == shapeKeepalive {
 		return
 	}
 	atomic.StoreInt64(&b.lastUDPSendNano, time.Now().UnixNano())
+}
+
+// noteUDPRecv stamps the inbound clocks for the liveness monitor. Both of them, because
+// an arriving UDP packet answers two different questions and the honest answers differ.
+//
+// "Has the peer come back onto UDP at all" - lastUDPRecvNano, any packet. While the
+// session rides the relay the server sends to the endpoint it last heard from, so UDP
+// traffic arriving at all means it has adopted our UDP source again (device/receive.go:
+// SetEndpointFromPacket), and it only does that on receiving a packet of ours. Any
+// inbound packet is therefore a completed round trip in that state - initiation included.
+//
+// "Is UDP carrying this session" - lastUDPProvenNano, which skips the handshake
+// initiation. On an established path an initiation is evidence AGAINST us: the peer
+// starts over only while it has not heard from us, and keeps doing so every RekeyTimeout.
+func (b *fallbackBind) noteUDPRecv(pkt []byte) {
+	shape := wgShape(pkt)
+	b.noteLiveness(shape)
+	switch shape {
+	case shapeUnknown:
+		// Not a WireGuard datagram, so not evidence of anything. The switch back to UDP
+		// is a real decision made on these stamps, and on 2026-11-10 one arrival that
+		// never reached the device moved the whole tunnel onto a dead path.
+		return
+	case shapeInitiation:
+		// Shaped right, so the peer is there and reachable TOWARDS us - but it is not
+		// evidence that we are reachable: the peer starts over only while it has NOT
+		// heard from us, and repeats every RekeyTimeout for as long as that lasts.
+		atomic.StoreInt64(&b.lastUDPRecvNano, time.Now().UnixNano())
+		atomic.StoreInt32(&b.everRecvUDP, 1)
+		return
+	}
+
+	// A response, a cookie reply or transport data: all three were sent BY the peer TO
+	// us, which is what both clocks are about.
+	now := time.Now().UnixNano()
+	atomic.StoreInt64(&b.lastUDPRecvNano, now)
+	atomic.StoreInt32(&b.everRecvUDP, 1)
+	atomic.StoreInt64(&b.lastUDPProvenNano, now)
+}
+
+// noteLiveness tells the host what an inbound packet says about the SESSION, whichever
+// carrier it arrived on. This is where that report belongs: the packet is here, with its
+// type and length, and the alternative - matching the device's own log lines in
+// classifyHandshake - was both a guess at a wording and a race the comments there had to
+// document, since the line for a handshake response is written BEFORE the stamp the host
+// then checks.
+//
+//   - a response, a cookie reply or transport data answers something of ours, so our own
+//     direction works: handshakeProven, the report that lifts the host out of
+//     Reconnecting on its own.
+//   - an initiation or a keepalive proves only that the peer is there. An initiation is
+//     evidence AGAINST us (the peer repeats it precisely while it has not heard from us),
+//     and a keepalive may be a persistent one, which owes nothing to a packet of ours.
+//     Both go up as handshakeHint, and what to do with them stays the host's call.
+func (b *fallbackBind) noteLiveness(shape int32) {
+	state := handshakeHint
+	switch shape {
+	case shapeUnknown:
+		return
+	case shapeExchange:
+		state = handshakeProven
+	}
+
+	now := time.Now().UnixNano()
+	if state == atomic.LoadInt32(&b.lastPushState) &&
+		now-atomic.LoadInt64(&b.lastPushNano) < int64(device.RekeyTimeout) {
+		return // the same thing we said a moment ago; the host has it
+	}
+	atomic.StoreInt32(&b.lastPushState, state)
+	atomic.StoreInt64(&b.lastPushNano, now)
+	if state == handshakeProven {
+		// A round trip landed, so the next send failure is news again.
+		resetSendFailurePacing()
+	}
+	notifyHandshakeState(state)
 }
 
 // Send routes the packet over the carrier selected by the current mode.
@@ -366,17 +677,54 @@ func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
 	case carrierTCP:
 		return b.sendTCP(buf)
 	case carrierProbe:
-		// Keep the real data flowing over TCP while speculatively re-probing
-		// UDP: a copy also goes out over UDP so that, if UDP has recovered, its
-		// replies refresh lastUDPRecvNano and monitor climbs back to the UDP
-		// carrier — WITHOUT ever blackholing live traffic into a still-blocked
-		// UDP path (which stalls the tunneled TCP for seconds every re-probe).
-		b.noteUDPSend(buf)
-		_ = b.inner.Send(buf, ep)
+		// The probe is ONE packet, it goes over UDP ALONE, and it is a handshake
+		// initiation or nothing.
+		//
+		// Alone, because the server sees two copies of one packet and drops the second by
+		// the replay filter BEFORE the endpoint is adopted (device/receive.go:
+		// ValidateCounter at 415, SetEndpointFromPacket at 419), so whichever copy arrives
+		// second might as well not have been sent - and when that is the UDP one, a warm
+		// relay against a cold direct path, the server never learns we are reachable on
+		// UDP. Measured on 2026-11-10: five probes in a row reported no answer over a path
+		// that was open the whole time.
+		//
+		// An initiation, because it is the only packet the server answers by itself, and a
+		// probe is worth exactly as much as its answer. Riding a keepalive instead left the
+		// verdict to the peer's own next packet - a keepalive interval away, and only if
+		// our own relay traffic had not moved the peer's endpoint back meanwhile - and the
+		// rules that had to be invented for that are gone with it.
+		//
+		// The CAS is what makes it one: the stamp is zeroed when the probe arms, so the
+		// first initiation after that takes the slot and everything else goes to the relay.
+		if wgShape(buf) != shapeInitiation {
+			return b.sendTCP(buf)
+		}
+		if atomic.CompareAndSwapInt64(&b.lastProbeSendNano, 0, time.Now().UnixNano()) {
+			b.noteUDPSend(buf)
+			if err := b.inner.Send(buf, ep); err != nil {
+				// Deliberately not returned: this packet is the probe, and a probe that
+				// could not leave is just a failed probe - the window expires and we stay
+				// on the relay. Handing the error up would turn it into wireguard-go's
+				// "Failed to send", which is a liveness verdict about a session that is
+				// perfectly healthy on the relay.
+				clog("CARRIER probe could not leave on UDP: %v", err)
+			}
+			return nil
+		}
 		return b.sendTCP(buf)
 	default: // carrierUDP
 		b.noteUDPSend(buf)
-		return b.inner.Send(buf, ep)
+		err := b.inner.Send(buf, ep)
+		if err != nil && sendFailureReportDue() {
+			// The datagram never reached the wire: the interface it would have left by is
+			// gone (WiFi off reads as "can't assign requested address"). Reported from
+			// here, where the error is, instead of being read back out of the device's log
+			// line about it. Paced, because a peer with traffic to send produces dozens a
+			// second and every report spends a unit of the host's retry budget.
+			clog("CARRIER udp send failed: %v", err)
+			notifyHandshakeState(handshakeDown)
+		}
+		return err
 	}
 }
 
@@ -387,11 +735,39 @@ func (b *fallbackBind) sendTCP(buf []byte) error {
 		clog("CARRIER sendTCP ensureWS err: %v", err)
 		return err
 	}
+	// A write that cannot complete must not hold the device's sender - see
+	// relayWriteTimeout. A deadline error is not fatal to the write, so it is logged and
+	// the send goes ahead: a connection that cannot take a deadline can still carry.
+	if derr := ws.SetWriteDeadline(time.Now().Add(relayWriteTimeout)); derr != nil {
+		clog("CARRIER sendTCP deadline err: %v", derr)
+	}
 	if err := websocket.Message.Send(ws, buf); err != nil {
 		clog("CARRIER sendTCP write err: %v", err)
+		// This connection is finished either way - a timed-out write leaves it poisoned -
+		// so drop it here instead of waiting for the reader to notice, and let the next
+		// packet dial a fresh one (paced by carrierRetryInterval).
+		b.dropWS()
 		return err
 	}
+	// Same keepalive exception noteUDPSend makes, for the same reason: nothing answers a
+	// keepalive, so our own cannot be what declares the relay dead.
+	if wgShape(buf) != shapeKeepalive {
+		atomic.StoreInt64(&b.lastTCPSendNano, time.Now().UnixNano())
+	}
 	return nil
+}
+
+// dropWS closes the current wss connection and forgets it, so the next packet dials a
+// fresh one. Closing is also what unblocks readLoop, which is otherwise parked in a read
+// that a half-open connection will never complete.
+func (b *fallbackBind) dropWS() {
+	b.mu.Lock()
+	ws := b.ws
+	b.ws = nil
+	b.mu.Unlock()
+	if ws != nil {
+		ws.Close()
+	}
 }
 
 // parseRelay turns the configured relay into what the WebSocket dialer needs: the
@@ -513,6 +889,41 @@ func (b *fallbackBind) dialWS() (*websocket.Conn, bool, error) {
 		cfg.Header.Set("Authorization", "Bearer "+b.relayToken)
 	}
 
+	// Resolve here rather than leaving it to the dialer, because the host has to be told
+	// which address this dial is about to use and the dialer never says. IPv4 only, like
+	// the rest of the client. On a relay the manager spells as an address - which is what
+	// it does today - this is the address itself and costs nothing.
+	if host := cfg.Location.Hostname(); host != "" {
+		addr := host
+		if net.ParseIP(host) == nil {
+			// Bounded by the same budget as the dial itself: a resolver that does not
+			// answer must not hold the sender that got here any longer than a dial would.
+			ctx, cancel := context.WithTimeout(context.Background(), carrierDialTimeout)
+			ips, lerr := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+			cancel()
+			if lerr != nil || len(ips) == 0 {
+				clog("CARRIER dial: cannot resolve %s: %v", host, lerr)
+				return fail(fmt.Errorf("resolve relay %q: %w", host, lerr))
+			}
+			addr = ips[0].String()
+			// Dial the address we just named to the host, not the name again - a second
+			// lookup could pick another one, and then the pin covers the wrong address.
+			// The certificate is still verified against the name.
+			port := cfg.Location.Port()
+			if port == "" {
+				port = "443"
+				if cfg.Location.Scheme == "ws" {
+					port = "80"
+				}
+			}
+			cfg.Location.Host = net.JoinHostPort(addr, port)
+			cfg.TlsConfig = &tls.Config{ServerName: host}
+			dialURL = cfg.Location.String()
+		}
+		// Before the dial, so the host's exclusion is in place when the packets leave.
+		notifyCarrierTarget(addr)
+	}
+
 	// The token is deliberately absent from the log line: it is a credential.
 	target, _ := b.canonEPText.Load().(string)
 	clog("CARRIER dialing %s (target %s)", dialURL, target)
@@ -582,7 +993,11 @@ func (b *fallbackBind) monitor() {
 	ticker := time.NewTicker(tickEvery)
 	defer ticker.Stop()
 
-	var tcpSince, probeSince time.Time
+	var tcpSince time.Time
+	// How long THIS relay spell waits before its next probe: short for the first look
+	// after the switch, udpReprobeEvery for every one after it. A local, because the
+	// schedule belongs to the spell and the spell belongs to this loop.
+	nextProbeIn := udpReprobeFirst
 	prevTick := time.Now()
 	for {
 		select {
@@ -596,29 +1011,36 @@ func (b *fallbackBind) monitor() {
 				// post-wake block is still caught one udpSilenceTimeout later.
 				atomic.StoreInt64(&b.lastUDPSendNano, 0)
 				atomic.StoreInt64(&b.lastUDPRecvNano, now.UnixNano())
-				// The windows this goroutine measures have to move with that
-				// baseline, because the recv stamp above is a fiction - nothing
-				// arrived, we simply refuse to count time we never watched. The
-				// carrierProbe branch cannot tell that fiction from a real packet:
-				// it asks whether a recv landed after probeSince, and a probe
-				// window opened BEFORE the sleep is satisfied by a stamp written
-				// after it. That is how a wake with UDP firewalled off announced
-				// "udp recovered" one tick later and moved the whole tunnel back
-				// onto a path where every send then failed with EADDRNOTAVAIL.
-				// Moving both windows to now makes the post-wake probe prove UDP
-				// on its own evidence, within its own udpReprobeWindow.
+				atomic.StoreInt64(&b.lastUDPProvenNano, now.UnixNano())
+				// The probe's own evidence has to go with that baseline, because the
+				// recv stamp above is a fiction - nothing arrived, we simply refuse to
+				// count time we never watched - and the probe cannot tell that fiction
+				// from a real packet: it asks whether a recv landed after its send, and
+				// a send from BEFORE the sleep is satisfied by a stamp written after it.
+				// That is how a wake with UDP firewalled off announced "udp recovered"
+				// one tick later and moved the whole tunnel back onto a path where every
+				// send then failed with EADDRNOTAVAIL. Clearing it makes the post-wake
+				// probe prove UDP on a packet it sent after the wake, or not at all.
+				atomic.StoreInt64(&b.lastProbeSendNano, 0)
 				tcpSince = now
-				probeSince = now
+				atomic.StoreInt64(&b.lastTCPRecvNano, now.UnixNano())
+				atomic.StoreInt64(&b.lastTCPSendNano, 0)
+				// A wake is also the one moment the network may have changed entirely
+				// underneath us, so look at UDP again on the short interval rather than
+				// carrying on with whatever this relay spell had got to.
+				nextProbeIn = udpReprobeFirst
 				prevTick = now
 				continue
 			}
 			prevTick = now
 
-			mode := atomic.LoadInt32(&b.mode)
-
-			lastUDP := time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano))
-			switch mode {
+			switch atomic.LoadInt32(&b.mode) {
 			case carrierUDP:
+				// The PROVEN clock here, not the plain recv one: on a path we are already
+				// using,
+				// inbound that cannot have been caused by us is not a sign of life. See
+				// noteUDPRecv and lastUDPProvenNano.
+				lastUDP := time.Unix(0, atomic.LoadInt64(&b.lastUDPProvenNano))
 				lastSend := time.Unix(0, atomic.LoadInt64(&b.lastUDPSendNano))
 				// Only a path we are actively using can be declared dead: require
 				// an outbound UDP packet since the last inbound one (lastSend >
@@ -655,12 +1077,27 @@ func (b *fallbackBind) monitor() {
 					}
 					// The dial can take seconds, and UDP may have answered during them -
 					// then there is nothing left to fall back from.
-					if time.Unix(0, atomic.LoadInt64(&b.lastUDPRecvNano)).After(lastUDP) {
+					if time.Unix(0, atomic.LoadInt64(&b.lastUDPProvenNano)).After(lastUDP) {
 						clog("CARRIER keeping UDP (recovered while dialling the relay)")
 						continue
 					}
 					atomic.StoreInt32(&b.mode, carrierTCP)
+					// No probe has ridden anything yet, and the branches below read this
+					// stamp as exactly that. Left standing, a send from before the switch
+					// would pair up with the server's next stragglers - it keeps our UDP
+					// endpoint until our first relay packet makes it migrate - and bounce
+					// the tunnel straight back onto the path we just left. Same "send
+					// strictly before recv" ordering Open uses, for the same reason.
+					atomic.StoreInt64(&b.lastProbeSendNano, 0)
+					atomic.StoreInt64(&b.lastUDPSendNano, 0)
 					tcpSince = now
+					nextProbeIn = udpReprobeFirst
+					// The spell starts with a clean slate on the relay side as well:
+					// lastTCPRecvNano is what tells a silent peer from a blocked UDP
+					// path, and a stamp left over from the last spell would answer for
+					// this one.
+					atomic.StoreInt64(&b.lastTCPRecvNano, now.UnixNano())
+					atomic.StoreInt64(&b.lastTCPSendNano, 0)
 					clog("CARRIER switch UDP->TCP (udp silent %v)", now.Sub(lastUDP).Truncate(time.Millisecond))
 					// The dial above was a real attempt and it succeeded: record it so
 					// carrierUp stays honest and a later drop still reports one down edge.
@@ -679,27 +1116,94 @@ func (b *fallbackBind) monitor() {
 					notifyCarrierState(true)
 				}
 			case carrierTCP:
-				// Periodically re-probe UDP, but non-destructively: enter the
-				// dual-send probe rather than diverting real data onto the
-				// (still-blocked) UDP path.
-				if now.Sub(tcpSince) > udpReprobeEvery {
+				// The relay's own liveness, which it never had before: the mirror of the
+				// UDP rule above, gated the same way. Only a carrier we are actively
+				// sending real packets on may be called dead, so an idle tunnel is never
+				// touched - and dropping the connection is the whole remedy, because the
+				// next packet dials a fresh one, possibly onto another front end. A wss
+				// whose far end goes away without closing the socket errors nowhere: the
+				// reader blocks, the writes land in the kernel buffer, and on 2026-11-13
+				// eighteen seconds of that silence (22:09:57-22:10:15) produced nothing
+				// but the host reporting Reconnecting.
+				relayRecv := time.Unix(0, atomic.LoadInt64(&b.lastTCPRecvNano))
+				relaySend := time.Unix(0, atomic.LoadInt64(&b.lastTCPSendNano))
+				if relaySend.After(relayRecv) && now.Sub(relayRecv) > relaySilenceTimeout {
+					clog("CARRIER relay silent %v; dropping the connection and redialling",
+						now.Sub(relayRecv).Truncate(time.Millisecond))
+					b.dropWS()
+					// The clocks belonged to the socket we have just thrown away.
+					atomic.StoreInt64(&b.lastTCPRecvNano, now.UnixNano())
+					atomic.StoreInt64(&b.lastTCPSendNano, 0)
+					// A relay that stopped carrying us is also the moment the direct path
+					// is most worth re-testing, so bring the next probe forward.
+					tcpSince = now
+					nextProbeIn = udpReprobeFirst
+					continue
+				}
+				// Periodically re-probe UDP, non-destructively: arm a probe, which puts
+				// exactly ONE packet on UDP (see Send) and leaves the rest of the traffic
+				// on the relay, and ask the device for the one packet worth riding it.
+				if now.Sub(tcpSince) > nextProbeIn {
 					atomic.StoreInt32(&b.mode, carrierProbe)
-					probeSince = now
+					atomic.StoreInt64(&b.lastProbeSendNano, 0)
+					atomic.StoreInt64(&b.probeArmedNano, now.UnixNano())
+					clog("CARRIER probing UDP (%v on the relay)",
+						now.Sub(tcpSince).Truncate(time.Second))
+					// In a goroutine because it reaches into the device's send path, which
+					// comes back into Send() on this same bind; the monitor must not be
+					// the one blocked there.
+					if initiate := b.probeHandshake; initiate != nil {
+						go initiate()
+					}
 				}
 			case carrierProbe:
+				// The probe is one handshake initiation on UDP and the answer to it, so
+				// there is one thing to wait for and one window to wait in. Until the
+				// initiation has left there is nothing to measure at all: the device
+				// rate-limits them to one per RekeyTimeout (device/send.go), so the one
+				// this probe asked for may be a few seconds out.
+				probeSentNano := atomic.LoadInt64(&b.lastProbeSendNano)
+				if probeSentNano == 0 {
+					// Nothing rode it. This wait used to be unbounded, and while the mode
+					// sits at carrierProbe the periodic re-probe above does not run - so a
+					// probe nobody rode could stop the climb back to UDP for the rest of
+					// the session.
+					armed := time.Unix(0, atomic.LoadInt64(&b.probeArmedNano))
+					if now.Sub(armed) > probeArmWindow {
+						atomic.StoreInt32(&b.mode, carrierTCP)
+						tcpSince = now
+						nextProbeIn = udpReprobeFirst
+						clog("CARRIER nothing rode the probe within %v; back to the relay",
+							probeArmWindow)
+					}
+					break // armed, with nothing to ride yet
+				}
+				probeSent := time.Unix(0, probeSentNano)
+				// The PROVEN clock, not lastUDPRecvNano: what answers an initiation is a
+				// handshake response, and that is a packet one-way traffic cannot produce.
+				// An inbound initiation on UDP would land on the other clock and prove
+				// nothing - the peer may still hold the UDP endpoint it had before the
+				// relay and be initiating into a path that carries nothing of ours.
+				lastProven := time.Unix(0, atomic.LoadInt64(&b.lastUDPProvenNano))
 				switch {
-				case lastUDP.After(probeSince):
-					// A UDP reply landed during the probe → UDP is back.
+				case lastProven.After(probeSent):
 					atomic.StoreInt32(&b.mode, carrierUDP)
-					clog("CARRIER switch TCP->UDP (udp recovered)")
+					clog("CARRIER switch TCP->UDP (the probe was answered)")
 					// Back across the UDP/relay boundary - see the UDP->TCP switch above.
 					// Nothing else reports this direction: the recovery is a plain mode
 					// store, with no dial and so no reportCarrier().
 					notifyCarrierState(true)
-				case now.Sub(probeSince) > udpReprobeWindow:
-					// UDP still dead; fall back to plain TCP until the next probe.
+				case now.Sub(probeSent) > udpReprobeWindow:
+					// One round trip is all this verdict needs, and all of it. The rules
+					// that used to hang off this branch - a late arrival still counting, a
+					// window the peer sat out in silence, our own relay traffic taking the
+					// probe's endpoint adoption back - existed only because the probe rode
+					// a keepalive, which nothing answers.
 					atomic.StoreInt32(&b.mode, carrierTCP)
 					tcpSince = now
+					nextProbeIn = udpReprobeEvery
+					clog("CARRIER probe unanswered on UDP within %v; staying on the relay",
+						udpReprobeWindow)
 				}
 			}
 		}
