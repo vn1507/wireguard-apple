@@ -950,6 +950,11 @@ func (b *fallbackBind) readLoop(ws *websocket.Conn) {
 	for {
 		var data []byte
 		if err := websocket.Message.Receive(ws, &data); err != nil {
+			// Mostly the relay hanging up, sometimes our own dropWS. Either way the
+			// socket is gone and the next packet redials; unlogged, that redial reads
+			// as a dial out of nowhere, which is how a relay-side close spent a whole
+			// session invisible.
+			clog("CARRIER relay read ended: %v", err)
 			break
 		}
 		if len(data) == 0 {
