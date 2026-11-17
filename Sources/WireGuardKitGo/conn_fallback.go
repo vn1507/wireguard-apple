@@ -645,6 +645,17 @@ func wgShape(pkt []byte) int32 {
 	return shapeUnknown
 }
 
+// noPathErr reports whether a send failed because this machine has no way to the peer at
+// all: no route, no address of its own, the interface gone. The datagram never reached the
+// wire, so the failure says nothing about the peer, about UDP, or about the session - only
+// about the path, which is why both callers treat it apart from every other error.
+// ECONNREFUSED is deliberately not here: that is an ICMP port-unreachable, so something
+// answered for the address and the verdict belongs to the session after all.
+func noPathErr(err error) bool {
+	return errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EADDRNOTAVAIL) ||
+		errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETDOWN)
+}
+
 // noteUDPSend opens a run of unanswered sends if none is open - see
 // unansweredSinceNano. Every packet counts, keepalives included, and that is a change
 // from the rule this replaced ("nothing answers a keepalive, so ours must not arm the
@@ -775,11 +786,23 @@ func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
 			b.noteUDPSend(buf)
 			if err := b.inner.Send(buf, ep); err != nil {
 				// Deliberately not returned: this packet is the probe, and a probe that
-				// could not leave is just a failed probe - the window expires and we stay
-				// on the relay. Handing the error up would turn it into wireguard-go's
-				// "Failed to send", which is a liveness verdict about a session that is
-				// perfectly healthy on the relay.
+				// could not leave is just a failed probe. Handing the error up would turn
+				// it into wireguard-go's "Failed to send", which is a liveness verdict
+				// about a session that is perfectly healthy on the relay.
 				clog("CARRIER probe could not leave on UDP: %v", err)
+				// It is not a verdict about UDP either, and letting it stand as the
+				// probe's one ride made it one: six seconds later the window expired and
+				// the log said "UDP still blocked, staying on the relay" on the strength
+				// of a packet that never reached the wire. That happened on every path
+				// change under a relay spell (2026-11-18 00:38:34, 00:38:51, 00:39:56),
+				// each one pushing the next real look at UDP a full cadence away. So put
+				// the probe back to waiting for a packet it can actually ride - still
+				// bounded by probeArmWindow - and tell the host what the direct path
+				// would have told it about a send that could not leave.
+				if noPathErr(err) {
+					atomic.StoreInt64(&b.lastProbeSendNano, 0)
+					notifyHandshakeState(handshakeNoPath)
+				}
 			}
 			return nil
 		}
@@ -801,8 +824,7 @@ func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
 			// something answered for the address and only the port is wrong.
 			clog("CARRIER udp send failed: %v", err)
 			state := handshakeDown
-			if errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EADDRNOTAVAIL) ||
-				errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETDOWN) {
+			if noPathErr(err) {
 				state = handshakeNoPath
 			}
 			notifyHandshakeState(state)
