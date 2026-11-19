@@ -33,6 +33,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -89,11 +90,12 @@ const (
 	// this is the moment the protocol itself calls the path dead, and switching exactly
 	// then puts the initiation WireGuard is about to send on the new carrier.
 	//
-	// It MUST stay below the host's PathSilenceTimeout (wgtimers.h), the moment the host
-	// REPORTS a loss and arms the service's one-minute teardown: the layer that can fix
-	// the problem has to act before the layer that can only complain about it. The other
-	// way round on 2026-11-13, the host reported Reconnecting at 15 s while the carrier
-	// only began looking for a way out at 25 s.
+	// This plus handshakeGrace - the moment we actually ACT on it - MUST stay below the
+	// host's PathSilenceTimeout (wgtimers.h), the moment the host REPORTS a loss and arms
+	// the service's one-minute teardown: the layer that can fix the problem has to act
+	// before the layer that can only complain about it. The other way round on
+	// 2026-11-13, the host reported Reconnecting at 15 s while the carrier only began
+	// looking for a way out at 25 s.
 	udpSilenceTimeout = device.KeepaliveTimeout + device.RekeyTimeout
 	udpReprobeEvery   = 30 * time.Second
 	udpReprobeWindow  = 5 * time.Second
@@ -103,6 +105,29 @@ const (
 	// reader blocks and the writes land in the kernel buffer. Nothing redialled it. That
 	// is the hole the 22:09:57-22:10:15 silence of 2026-11-13 fell through.
 	relaySilenceTimeout = udpSilenceTimeout
+
+	// Neither threshold above is acted on until a question we asked has gone unanswered,
+	// and this is how long the answer has to arrive.
+	//
+	// Measured over a 72-minute idle macOS session (2026-11-17): the gateway's inbound
+	// keepalive arrives every ~13 s - 207 of 296 gaps fell in 11-14 s - and not every
+	// KeepaliveTimeout, which is what the numbers above assume. That leaves ~1.5 s of
+	// margin, so ordinary jitter reads a healthy path as a dead one: 18 silence verdicts
+	// in 72 minutes, all 18 false. Ten switched the tunnel onto the relay, eight were
+	// saved only by the dial below taking ~600 ms, and every one of the ten was reverted
+	// within a second by the re-probe - whose handshake came back in ~200 ms. The send
+	// gate does not catch this, because it is armed by any egress that warrants a reply,
+	// and plenty of egress legitimately never gets one (the host's own LAN is routed
+	// into the tunnel).
+	//
+	// One RekeyTimeout, because that is the device's own rate limit on handshake
+	// initiations (device/send.go) and therefore the shortest window guaranteed to
+	// contain one: an ask the limit swallows means WG sent its own a moment earlier, and
+	// that one going unanswered is the same evidence. A path that is merely quiet answers
+	// in a round trip; a dead one cannot answer at all. Deliberately not a bigger number:
+	// it is added to every verdict, and the whole ladder above it (PathSilenceTimeout,
+	// the service's teardown) is spaced in these same quanta.
+	handshakeGrace = device.RekeyTimeout
 
 	// One write to the relay socket may not hold the device's sender for longer than
 	// this. Without a deadline a stalled connection (a full window, a path that stopped
@@ -248,13 +273,29 @@ type fallbackBind struct {
 	// packet (atomic). Stale-ness past udpSilenceTimeout triggers fallback.
 	lastUDPRecvNano int64
 
-	// lastUDPSendNano is the wall-clock time of the most recent outbound UDP
-	// packet (atomic). The monitor only counts inbound silence as a dead path
-	// when we have actually sent over UDP since the last inbound packet
-	// (lastUDPSendNano > lastUDPRecvNano), mirroring the C++ watchdog's
-	// txAdvanced gate: an idle tunnel with no traffic and no PersistentKeepalive
-	// legitimately goes quiet and must not flap onto the TCP carrier.
-	lastUDPSendNano int64
+	// unansweredSinceNano is when the current run of unanswered sends began (atomic),
+	// 0 when nothing is waiting for an answer. Every outbound packet opens a run if none
+	// is open; the first inbound packet that proves our direction closes it
+	// (noteUDPRecv). So this measures the one thing a silence verdict is about: how long
+	// we have been talking into nothing.
+	//
+	// It replaced a pair of stamps - "when did we last send" and "when did we last hear"
+	// - compared against each other, and the difference is not cosmetic. That pair reads
+	// the peer's cadence as much as our own: with PersistentKeepalive 25 s in the profile
+	// and inbound arriving only in reply to it, the inbound clock was already 25 s old
+	// by the time a send re-armed the gate, so the verdict was made the instant it was
+	// allowed - past the ask window, with no handshake ever forced. And it could not be
+	// cured by raising the threshold: the number to clear is whatever cadence a gateway
+	// happens to use (~13 s on uswest, 25 s here), which is not ours to know. Measured
+	// from OUR packet there is nothing to know: WireGuard's own rule is that a peer which
+	// received from us owes us something within KeepaliveTimeout, and the device uses the
+	// same deadline for the same purpose ("Retrying handshake because we stopped hearing
+	// back after 15 seconds", timers.go).
+	//
+	// Not "when did we last send": a tunnel sending continuously would push that stamp
+	// forward faster than any threshold could catch it, and a busy session on a dead path
+	// would never be judged at all. A run starts once and stands until it is answered.
+	unansweredSinceNano int64
 
 	// lastUDPProvenNano is lastUDPRecvNano without the inbound packets that say
 	// nothing about OUR direction (atomic). Today that is the handshake initiation:
@@ -276,8 +317,8 @@ type fallbackBind struct {
 	// this, not a wall-clock window, is what the probe is measured against - it is the
 	// moment a reply became possible at all.
 	//
-	// Distinct from lastUDPSendNano because that one deliberately skips keepalives (see
-	// noteUDPSend): nothing answers a keepalive, so it cannot arm the silence detector.
+	// Distinct from unansweredSinceNano, which is about the path we are on rather than
+	// the one we are testing, and which any packet opens.
 	// For a probe a keepalive is enough, and on an idle tunnel it is all there is - the
 	// server authenticates it, adopts the source it arrived from (device/receive.go:
 	// SetEndpointFromPacket) and its own next packet comes back over UDP. That is the
@@ -412,6 +453,29 @@ func (b *fallbackBind) ArmProbe() {
 	}
 }
 
+// KickHandshake makes the device send a handshake initiation now, over whatever carrier
+// the bind is on. The host calls it (wgKickHandshake) together with the socket bump that
+// follows a network change, and the two answer different halves of the same question: the
+// bump gives the peer a socket that can reach it from the new network, and this gives it
+// a packet it is obliged to answer.
+//
+// The bump alone is not that packet. It sends keepalives on the current keypair
+// (SendKeepalivesToPeersWithCurrentKeypair), and a keepalive is answered only by the
+// peer's own keepalive timer - when it answers at all: on 2026-11-17 a phone-to-WiFi
+// switch left a valid keypair with nothing to send, so WireGuard's own handshake ladder
+// never started, the only packets on the wire for 76 s were three PersistentKeepalives,
+// and the gateway ignored the first two. It answers an initiation at once, every time -
+// 170 to 440 ms in that same log.
+//
+// Nothing to arm and nothing to wait for: this is a push, not a probe. The device
+// rate-limits initiations to one per RekeyTimeout, so a caller on a watchdog tick cannot
+// make it expensive.
+func (b *fallbackBind) KickHandshake() {
+	if initiate := b.probeHandshake; initiate != nil {
+		go initiate()
+	}
+}
+
 // Mode returns the carrier the bind is currently sending on (carrierUDP,
 // carrierTCP, or carrierProbe), read atomically. The host app queries it through
 // the bridge (wgGetCarrierMode) to report the live transport — e.g. the relay's
@@ -456,7 +520,7 @@ func (b *fallbackBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		now := time.Now().UnixNano()
 		atomic.StoreInt64(&b.lastUDPRecvNano, now)
 		atomic.StoreInt64(&b.lastUDPProvenNano, now)
-		atomic.StoreInt64(&b.lastUDPSendNano, 0)
+		atomic.StoreInt64(&b.unansweredSinceNano, 0)
 	}
 	// The liveness clocks deliberately survive a re-open, for the same reason the
 	// mode does. A fresh recv stamp is indistinguishable from an arrived packet, and
@@ -581,19 +645,34 @@ func wgShape(pkt []byte) int32 {
 	return shapeUnknown
 }
 
-// noteUDPSend records an outbound UDP packet for the liveness monitor, but only
-// for packets that warrant a reply. WireGuard keepalives are one-way (the peer
-// never answers them), so counting our own keepalive as "we are using the path"
-// would let an otherwise idle tunnel — whose sole egress is its keepalives —
-// falsely trip the UDP->TCP switch. This makes the client robust whether or not
-// the server is configured to send keepalives back: handshakes and real data
-// still arm the detector, so a genuinely blocked path (we keep sending, nothing
-// comes back) is still caught.
+// noPathErr reports whether a send failed because this machine has no way to the peer at
+// all: no route, no address of its own, the interface gone. The datagram never reached the
+// wire, so the failure says nothing about the peer, about UDP, or about the session - only
+// about the path, which is why both callers treat it apart from every other error.
+// ECONNREFUSED is deliberately not here: that is an ICMP port-unreachable, so something
+// answered for the address and the verdict belongs to the session after all.
+func noPathErr(err error) bool {
+	return errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EADDRNOTAVAIL) ||
+		errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETDOWN)
+}
+
+// noteUDPSend opens a run of unanswered sends if none is open - see
+// unansweredSinceNano. Every packet counts, keepalives included, and that is a change
+// from the rule this replaced ("nothing answers a keepalive, so ours must not arm the
+// detector").
+//
+// Something does answer it: a peer that receives any authenticated packet and has nothing
+// of its own to send owes a passive keepalive within KeepaliveTimeout (device/timers.go),
+// which is precisely why WireGuard calls the path dead at KeepaliveTimeout + RekeyTimeout.
+// Measured on 2026-11-17 23:52:07.935: the gateway answered one of ours in 282 ms. The
+// old rule mattered because a false verdict was acted on at once; now a verdict asks for
+// a handshake first and is withdrawn the moment anything answers (see handshakeGrace), so
+// the cost of arming on a keepalive is one initiation and the cost of NOT arming on it was
+// a tunnel with no traffic of its own going blind - which is what left a phone-to-WiFi
+// switch unnoticed for 76 s (23:50:52 -> 23:52:08), the client sending nothing in all that
+// time but three PersistentKeepalives and nothing in the client ever asking why.
 func (b *fallbackBind) noteUDPSend(buf []byte) {
-	if wgShape(buf) == shapeKeepalive {
-		return
-	}
-	atomic.StoreInt64(&b.lastUDPSendNano, time.Now().UnixNano())
+	atomic.CompareAndSwapInt64(&b.unansweredSinceNano, 0, time.Now().UnixNano())
 }
 
 // noteUDPRecv stamps the inbound clocks for the liveness monitor. Both of them, because
@@ -632,6 +711,10 @@ func (b *fallbackBind) noteUDPRecv(pkt []byte) {
 	atomic.StoreInt64(&b.lastUDPRecvNano, now)
 	atomic.StoreInt32(&b.everRecvUDP, 1)
 	atomic.StoreInt64(&b.lastUDPProvenNano, now)
+	// Answered: whatever we were waiting for has arrived, so the run is over and the next
+	// send starts a fresh one. Only this branch may do it - an initiation proves nothing
+	// about our direction and must leave the run standing.
+	atomic.StoreInt64(&b.unansweredSinceNano, 0)
 }
 
 // noteLiveness tells the host what an inbound packet says about the SESSION, whichever
@@ -703,11 +786,23 @@ func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
 			b.noteUDPSend(buf)
 			if err := b.inner.Send(buf, ep); err != nil {
 				// Deliberately not returned: this packet is the probe, and a probe that
-				// could not leave is just a failed probe - the window expires and we stay
-				// on the relay. Handing the error up would turn it into wireguard-go's
-				// "Failed to send", which is a liveness verdict about a session that is
-				// perfectly healthy on the relay.
+				// could not leave is just a failed probe. Handing the error up would turn
+				// it into wireguard-go's "Failed to send", which is a liveness verdict
+				// about a session that is perfectly healthy on the relay.
 				clog("CARRIER probe could not leave on UDP: %v", err)
+				// It is not a verdict about UDP either, and letting it stand as the
+				// probe's one ride made it one: six seconds later the window expired and
+				// the log said "UDP still blocked, staying on the relay" on the strength
+				// of a packet that never reached the wire. That happened on every path
+				// change under a relay spell (2026-11-18 00:38:34, 00:38:51, 00:39:56),
+				// each one pushing the next real look at UDP a full cadence away. So put
+				// the probe back to waiting for a packet it can actually ride - still
+				// bounded by probeArmWindow - and tell the host what the direct path
+				// would have told it about a send that could not leave.
+				if noPathErr(err) {
+					atomic.StoreInt64(&b.lastProbeSendNano, 0)
+					notifyHandshakeState(handshakeNoPath)
+				}
 			}
 			return nil
 		}
@@ -721,8 +816,18 @@ func (b *fallbackBind) Send(buf []byte, ep conn.Endpoint) error {
 			// here, where the error is, instead of being read back out of the device's log
 			// line about it. Paced, because a peer with traffic to send produces dozens a
 			// second and every report spends a unit of the host's retry budget.
+			//
+			// WHICH report, though, is the errno's to say, and this is the only place it
+			// still exists. A local send failure says the machine has no way to the peer -
+			// that is the pause (handshakeNoPath), not one of three failed attempts. The
+			// others stay a session verdict: ECONNREFUSED is an ICMP port-unreachable, so
+			// something answered for the address and only the port is wrong.
 			clog("CARRIER udp send failed: %v", err)
-			notifyHandshakeState(handshakeDown)
+			state := handshakeDown
+			if noPathErr(err) {
+				state = handshakeNoPath
+			}
+			notifyHandshakeState(state)
 		}
 		return err
 	}
@@ -749,6 +854,23 @@ func (b *fallbackBind) sendTCP(buf []byte) error {
 		b.dropWS()
 		return err
 	}
+	// The deadline was for THIS write and must not outlive it. x/net/websocket writes
+	// from its READER too - Receive answers a server ping with a pong (hybi.go,
+	// WritePong) and a close frame with one of its own - on this same connection, so a
+	// deadline left in the past makes those writes fail instantly and Receive hands the
+	// failure back as if the read had died. That is what killed 9 of the 13 relay
+	// connections of the 2026-11-17 session, each about 30 s after its last send:
+	// "CARRIER relay read ended: write tcp ...: i/o timeout", a healthy socket dropped
+	// because a pong could not be written. On a tunnel idling on the relay, where real
+	// sends are minutes apart, that is every ping the front end makes.
+	//
+	// Cleared rather than extended: the next send sets its own, and a write left running
+	// without one is still caught by relaySilenceTimeout. A concurrent sender can clear
+	// the deadline this one is still writing under - Codec.Send serialises the frames,
+	// not this call - which costs that one write its bound and nothing else.
+	if derr := ws.SetWriteDeadline(time.Time{}); derr != nil {
+		clog("CARRIER sendTCP deadline clear err: %v", derr)
+	}
 	// Same keepalive exception noteUDPSend makes, for the same reason: nothing answers a
 	// keepalive, so our own cannot be what declares the relay dead.
 	if wgShape(buf) != shapeKeepalive {
@@ -768,6 +890,24 @@ func (b *fallbackBind) dropWS() {
 	if ws != nil {
 		ws.Close()
 	}
+	// The silence clocks belong to the connection, not to the bind: whatever this one
+	// did or did not deliver says nothing about its replacement. Every other way of
+	// losing a connection used to leave them standing - a write error here, an EOF in
+	// readLoop - so the next dial inherited the dead one's silence and the monitor
+	// dropped a connection seconds old for it (2026-11-16 15:05:42.772: "relay silent
+	// 16.432s" over a conn 0.66 s old, measured from a keepalive the PREVIOUS socket
+	// received, and the redial that followed cost another 11.7 s without a carrier).
+	b.noteRelayReset()
+}
+
+// noteRelayReset starts the relay's silence window over. Called wherever the wss
+// connection is replaced; the monitor's own drop branch and the UDP->TCP switch do the
+// same thing inline, for the same reason. Same "send strictly before recv" ordering
+// those use: a send stamp left standing over a fresh recv stamp is what the silence
+// rule reads as "we are sending and hearing nothing back".
+func (b *fallbackBind) noteRelayReset() {
+	atomic.StoreInt64(&b.lastTCPRecvNano, time.Now().UnixNano())
+	atomic.StoreInt64(&b.lastTCPSendNano, 0)
 }
 
 // parseRelay turns the configured relay into what the WebSocket dialer needs: the
@@ -935,6 +1075,10 @@ func (b *fallbackBind) dialWS() (*websocket.Conn, bool, error) {
 	clog("CARRIER dial OK")
 	b.lastDialErr = nil
 	b.ws = ws
+	// A fresh connection gets a fresh window - see noteRelayReset. This covers the one
+	// path dropWS does not: readLoop clearing b.ws on EOF, after which the next send
+	// dials without anything having been dropped.
+	b.noteRelayReset()
 	go b.readLoop(ws)
 	return ws, true, nil
 }
@@ -1014,7 +1158,7 @@ func (b *fallbackBind) monitor() {
 				// ours to trust. Reset the UDP baseline (send strictly before
 				// recv, mirroring Open) and skip this tick's verdict so a real
 				// post-wake block is still caught one udpSilenceTimeout later.
-				atomic.StoreInt64(&b.lastUDPSendNano, 0)
+				atomic.StoreInt64(&b.unansweredSinceNano, 0)
 				atomic.StoreInt64(&b.lastUDPRecvNano, now.UnixNano())
 				atomic.StoreInt64(&b.lastUDPProvenNano, now.UnixNano())
 				// The probe's own evidence has to go with that baseline, because the
@@ -1041,23 +1185,47 @@ func (b *fallbackBind) monitor() {
 
 			switch atomic.LoadInt32(&b.mode) {
 			case carrierUDP:
-				// The PROVEN clock here, not the plain recv one: on a path we are already
-				// using,
-				// inbound that cannot have been caused by us is not a sign of life. See
-				// noteUDPRecv and lastUDPProvenNano.
+				// How long we have been waiting for an answer - see
+				// unansweredSinceNano. Zero means nothing is waiting: a tunnel with no
+				// traffic at all cannot be judged, which is the same protection the old
+				// send-after-recv gate gave an idle session and the C++ watchdog's
+				// txAdvanced gate still gives it.
+				unanswered := atomic.LoadInt64(&b.unansweredSinceNano)
+				// Kept for the log line and for the probe below, which asks a different
+				// question ("has the peer come back onto UDP at all").
 				lastUDP := time.Unix(0, atomic.LoadInt64(&b.lastUDPProvenNano))
-				lastSend := time.Unix(0, atomic.LoadInt64(&b.lastUDPSendNano))
-				// Only a path we are actively using can be declared dead: require
-				// an outbound UDP packet since the last inbound one (lastSend >
-				// lastUDP). This mirrors the C++ watchdog's txAdvanced gate — an
-				// idle tunnel sends nothing, so it never trips this even past
-				// udpSilenceTimeout, while a real block (we keep sending handshake
-				// initiations, nothing comes back) does.
-				silence := udpSilenceTimeout
+				// Two thresholds rather than one: ask at the first, act at the second.
+				// See handshakeGrace for what the gap is worth.
+				ask, act := udpSilenceTimeout, udpSilenceTimeout+handshakeGrace
 				if atomic.LoadInt32(&b.everRecvUDP) == 0 {
-					silence = udpConnectSilenceTimeout
+					// Connecting, and nothing has ever answered on this path: there is no
+					// question left to ask, since every initiation WG has sent this
+					// session already is one and none came back. Granting the grace here
+					// would only push the first fallback towards the host's connect
+					// timeout, which is the one thing udpConnectSilenceTimeout exists to
+					// stay inside.
+					ask, act = udpConnectSilenceTimeout, udpConnectSilenceTimeout
 				}
-				if lastSend.After(lastUDP) && now.Sub(lastUDP) > silence {
+				if unanswered != 0 && now.Sub(time.Unix(0, unanswered)) > ask {
+					waited := now.Sub(time.Unix(0, unanswered))
+					if waited <= act {
+						// Inside the window: ask, and let the answer decide. On every
+						// tick of it, because the device drops initiations past one per
+						// RekeyTimeout (device/send.go) and that paces this for us - the
+						// same bargain the probe below makes. The answer, a handshake
+						// response, is proof in the only direction that matters, so it
+						// lands on lastUDPProvenNano and this branch stops firing by
+						// itself. Asking only INSIDE the window is what keeps it a
+						// question and not a habit: past the window the verdict is made,
+						// and on a path with no relay to fall back to (an empty relay
+						// URL, or one that cannot be dialled) every tick would otherwise
+						// go on nudging a handshake out of a tunnel that has already been
+						// given up on.
+						if initiate := b.probeHandshake; initiate != nil {
+							go initiate()
+						}
+						continue
+					}
 					// Silence says UDP is not carrying us. It does not say the relay
 					// would, so prove that before giving up the path we have. With no
 					// network at all - WiFi switched off - every UDP send fails with
@@ -1075,8 +1243,8 @@ func (b *fallbackBind) monitor() {
 					prevTick = time.Now()
 					if derr != nil || ws == nil {
 						if attempted {
-							clog("CARRIER keeping UDP (udp silent %v, relay unreachable: %v)",
-								now.Sub(lastUDP).Truncate(time.Millisecond), derr)
+							clog("CARRIER keeping UDP (%v unanswered, relay unreachable: %v)",
+								waited.Truncate(time.Millisecond), derr)
 						}
 						continue
 					}
@@ -1094,7 +1262,7 @@ func (b *fallbackBind) monitor() {
 					// the tunnel straight back onto the path we just left. Same "send
 					// strictly before recv" ordering Open uses, for the same reason.
 					atomic.StoreInt64(&b.lastProbeSendNano, 0)
-					atomic.StoreInt64(&b.lastUDPSendNano, 0)
+					atomic.StoreInt64(&b.unansweredSinceNano, 0)
 					tcpSince = now
 					nextProbeIn = udpReprobeFirst
 					// The spell starts with a clean slate on the relay side as well:
@@ -1103,7 +1271,9 @@ func (b *fallbackBind) monitor() {
 					// this one.
 					atomic.StoreInt64(&b.lastTCPRecvNano, now.UnixNano())
 					atomic.StoreInt64(&b.lastTCPSendNano, 0)
-					clog("CARRIER switch UDP->TCP (udp silent %v)", now.Sub(lastUDP).Truncate(time.Millisecond))
+					clog("CARRIER switch UDP->TCP (%v unanswered, nothing inbound for %v)",
+						waited.Truncate(time.Millisecond),
+						now.Sub(lastUDP).Truncate(time.Millisecond))
 					// The dial above was a real attempt and it succeeded: record it so
 					// carrierUp stays honest and a later drop still reports one down edge.
 					b.reportCarrier(true)
@@ -1133,6 +1303,19 @@ func (b *fallbackBind) monitor() {
 				relayRecv := time.Unix(0, atomic.LoadInt64(&b.lastTCPRecvNano))
 				relaySend := time.Unix(0, atomic.LoadInt64(&b.lastTCPSendNano))
 				if relaySend.After(relayRecv) && now.Sub(relayRecv) > relaySilenceTimeout {
+					if now.Sub(relayRecv) <= relaySilenceTimeout+handshakeGrace {
+						// Ask before acting, exactly as the UDP branch above and for the
+						// same measured reason (see handshakeGrace): what keeps this clock
+						// fresh on an idle tunnel is the peer's keepalives, and they
+						// arrive every ~13 s against a 15 s threshold. In this mode Send
+						// puts everything on the relay, so the initiation tests precisely
+						// the socket in doubt and its answer comes back on
+						// lastTCPRecvNano. The re-probe below can wait that long.
+						if initiate := b.probeHandshake; initiate != nil {
+							go initiate()
+						}
+						continue
+					}
 					clog("CARRIER relay silent %v; dropping the connection and redialling",
 						now.Sub(relayRecv).Truncate(time.Millisecond))
 					b.dropWS()
@@ -1169,10 +1352,26 @@ func (b *fallbackBind) monitor() {
 				// this probe asked for may be a few seconds out.
 				probeSentNano := atomic.LoadInt64(&b.lastProbeSendNano)
 				if probeSentNano == 0 {
-					// Nothing rode it. This wait used to be unbounded, and while the mode
-					// sits at carrierProbe the periodic re-probe above does not run - so a
-					// probe nobody rode could stop the climb back to UDP for the rest of
-					// the session.
+					// Nothing has ridden it yet, so ask again. The device rate-limits
+					// handshake initiations to one per RekeyTimeout (device/send.go) and
+					// that limit applies to a forced one as well, so the initiation the
+					// arming above asked for is simply dropped when WG sent one a moment
+					// earlier - which is exactly the case this probe exists for, since a
+					// silent path is one WG is already retrying on. The probe then spent
+					// its whole window on nothing and, while the mode sits at
+					// carrierProbe, the periodic re-probe does not run either
+					// (2026-11-16 15:07:34.827 initiation -> 15:07:35.019 arm ->
+					// 15:07:45.768 "nothing rode the probe", and UDP only came back at
+					// 15:07:57, 22 s of TCP-over-TCP for a question answered in one round
+					// trip). Re-asking on each tick costs nothing: WG's own limit paces
+					// it, and the first attempt that is allowed takes the slot.
+					if initiate := b.probeHandshake; initiate != nil {
+						go initiate()
+					}
+					// This wait used to be unbounded, and while the mode sits at
+					// carrierProbe the periodic re-probe above does not run - so a probe
+					// nobody rode could stop the climb back to UDP for the rest of the
+					// session.
 					armed := time.Unix(0, atomic.LoadInt64(&b.probeArmedNano))
 					if now.Sub(armed) > probeArmWindow {
 						atomic.StoreInt32(&b.mode, carrierTCP)

@@ -31,6 +31,7 @@ extern int64_t wgSetConfig(int handle, const char *settings);
 extern char *wgGetConfig(int handle);
 extern int32_t wgGetCarrierMode(int handle);
 extern void wgBumpSockets(int handle);
+extern void wgKickHandshake(int handle);
 /* Arms a UDP probe that only a handshake initiation may ride, and only while the
  * session is on the wss carrier. Called when the host's own watchdog gives up on
  * the relay: WireGuard is re-initiating every RekeyTimeout anyway, and this puts the

@@ -140,6 +140,16 @@ const (
 	handshakeDown   int32 = 0 // the session is dead (WG gave up, or a send never left)
 	handshakeProven int32 = 1 // a full round trip landed: report it
 	handshakeHint   int32 = 2 // something arrived; whether it proves anything is the host's call
+	// A send that never left this machine, which is a verdict about the PATH and not
+	// about the session: no route, no address, the interface gone. Distinct from
+	// handshakeDown because the host does different things with them - down is one failed
+	// attempt out of three, this one is the pause - and because only the bind can tell
+	// them apart: by the time the error is a log line, the errno is gone. On 2026-11-17 a
+	// 314 ms WiFi blip was reported "available" again before the interface had an address;
+	// the sends that followed failed with ENETUNREACH, each spent one of three attempts,
+	// and 19 s later the session was torn down and the user tunnel demoted over a network
+	// that had never actually come back.
+	handshakeNoPath int32 = 3
 )
 
 var (
@@ -410,6 +420,15 @@ func wgArmUDPProbe(tunnelHandle int32) {
 		return
 	}
 	handle.bind.ArmProbe()
+}
+
+//export wgKickHandshake
+func wgKickHandshake(tunnelHandle int32) {
+	handle, ok := tunnelHandles[tunnelHandle]
+	if !ok || handle.bind == nil {
+		return
+	}
+	handle.bind.KickHandshake()
 }
 
 //export wgBumpSockets
